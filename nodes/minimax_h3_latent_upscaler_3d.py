@@ -608,6 +608,18 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
 
         selected_mode = mode["mode"]
         src = latent["samples"]
+        if getattr(src, "is_nested", False) and hasattr(src, "unbind"):
+            raise TypeError(
+                "This node only accepts a plain video LATENT. The connected latent is a "
+                "joint MiniMax H3 AV (audio+video) NestedTensor, produced by an H3 AV "
+                "sampling/guide node. Use 'MiniMax H3 Latent Upscaler + Refine (3D)' "
+                "instead — it upscales the video member and rebuilds the joint AV latent "
+                "with the audio left untouched."
+            )
+        if not isinstance(src, torch.Tensor):
+            raise TypeError(
+                f"MiniMax H3 latent samples must be a torch.Tensor, got {type(src).__name__}"
+            )
         orig_dtype = src.dtype
         was_4d = (src.dim() == 4)
 
