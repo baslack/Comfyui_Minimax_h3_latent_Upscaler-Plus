@@ -127,9 +127,12 @@ class MinimaxH3LatentUpscaler3DProvider:
     FUNCTION = "build"
     CATEGORY = "video/MinimaxH3"
     DESCRIPTION = (
-        "Checkpoint/device configuration for one exact-target, clean-video learned latent transform. "
-        "Connect as a side input to compatible progressive handoff nodes; this node performs no "
-        "sampling and never receives H3 audio."
+        "Loads/configures one MiniMax H3 learned-upscaler checkpoint, separately from any node "
+        "that applies it. Connect its 'learned_upscaler' output to the optional input of the same "
+        "name on 'Minimax H3 Latent Upscaler (3D)', 'MiniMax H3 Resize Target Conditioning', or a "
+        "compatible progressive handoff consumer, so every consumer shares the exact same loaded "
+        "checkpoint instead of each one picking model_name/device/precision on its own. This node "
+        "performs no sampling and never receives H3 audio."
     )
 
     def build(self, model_name, device, precision, offload_after_upscale=False):
