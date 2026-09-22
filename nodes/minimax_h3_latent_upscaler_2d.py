@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
-import glob
 import folder_paths
 import re
 from einops import rearrange
@@ -18,11 +17,13 @@ from einops import rearrange
 # 注册模型文件夹
 # ==========================================
 _LATENT_UPSCALE_FOLDER = "latent_upscale_models"
+_LATENT_UPSCALE_EXTENSIONS = {".pth", ".safetensors"}
 if _LATENT_UPSCALE_FOLDER not in folder_paths.folder_names_and_paths:
     folder_paths.add_model_folder_path(
         _LATENT_UPSCALE_FOLDER,
         os.path.join(folder_paths.models_dir, _LATENT_UPSCALE_FOLDER)
     )
+folder_paths.folder_names_and_paths[_LATENT_UPSCALE_FOLDER][1].update(_LATENT_UPSCALE_EXTENSIONS)
 
 # ==========================================
 # Minimax H3 归一化参数 (24通道)
@@ -274,12 +275,11 @@ def get_models_dir():
     return folder_paths.get_folder_paths(_LATENT_UPSCALE_FOLDER)[0]
 
 def scan_models():
-    files = []
-    model_dir = get_models_dir()
-    for ext in ("*.pth", "*.safetensors"):
-        files.extend(glob.glob(os.path.join(model_dir, ext)))
-    names = sorted(os.path.basename(f) for f in files)
-    return names if names else [f"(请将模型放入: {model_dir})"]
+    # Recursively browses every registered latent_upscale_models path (including
+    # subfolders and any extra_model_paths.yaml entries) instead of only the
+    # top-level default directory, so checkpoints don't have to sit in its root.
+    names = folder_paths.get_filename_list(_LATENT_UPSCALE_FOLDER)
+    return names if names else [f"(请将模型放入: {get_models_dir()})"]
 
 def _convert_state_tensor(tensor, dtype):
     if torch.is_tensor(tensor) and tensor.is_floating_point() and tensor.dtype != dtype:
@@ -377,9 +377,7 @@ def load_model(name, device, precision):
     if cache_key in MODEL_CACHE:
         return MODEL_CACHE[cache_key]
 
-    path = os.path.join(get_models_dir(), name)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"模型文件不存在: {path}")
+    path = folder_paths.get_full_path_or_raise(_LATENT_UPSCALE_FOLDER, name)
 
     dtype = _PRECISION_DTYPES.get(precision, torch.float32)
     up_sd = _load_raw_sd(path, device, dtype)
@@ -453,6 +451,18 @@ class MinimaxH3LatentUpscalerNode2D:
         model = load_model(model_name, dev, precision)
 
         samples = latent["samples"]
+        if getattr(samples, "is_nested", False) and hasattr(samples, "unbind"):
+            raise TypeError(
+                "This node only accepts a plain video LATENT. The connected latent is a "
+                "joint MiniMax H3 AV (audio+video) NestedTensor, produced by an H3 AV "
+                "sampling/guide node. Use 'MiniMax H3 Latent Upscaler + Refine (3D)' "
+                "instead — it upscales the video member and rebuilds the joint AV latent "
+                "with the audio left untouched."
+            )
+        if not isinstance(samples, torch.Tensor):
+            raise TypeError(
+                f"MiniMax H3 latent samples must be a torch.Tensor, got {type(samples).__name__}"
+            )
         orig_dtype = samples.dtype
         was_4d = len(samples.shape) == 4
         s = samples.unsqueeze(2) if was_4d else samples
