@@ -9,7 +9,6 @@ import torch
 
 H3_LATENT_UPSCALER_API_VERSION = 1
 H3_LATENT_UPSCALER_KIND = "minimax_h3_learned_latent_upscaler"
-PREFERRED_H3_LATENT_UPSCALER_MODEL = "minimax_h3_latent_upscaler_3d_bf16.safetensors"
 
 
 def _lbh_module():
@@ -24,7 +23,7 @@ class H3LatentUpscalerProvider:
 
     model_name: str
     device: str = "cuda"
-    precision: str = "bf16"
+    precision: str = "fp16"
     offload_after_upscale: bool = False
 
     api_version: ClassVar[int] = H3_LATENT_UPSCALER_API_VERSION
@@ -79,17 +78,11 @@ class MinimaxH3LatentUpscaler3DProvider:
     @classmethod
     def INPUT_TYPES(cls):
         lbh = _lbh_module()
-        models = lbh.scan_models()
-        model_spec = (
-            (models, {"default": PREFERRED_H3_LATENT_UPSCALER_MODEL})
-            if PREFERRED_H3_LATENT_UPSCALER_MODEL in models
-            else (models,)
-        )
         return {
             "required": {
-                "model_name": model_spec,
+                "model_name": (lbh.scan_models(),),
                 "device": (["cuda", "cpu"], {"default": "cuda"}),
-                "precision": (["fp32", "fp16", "bf16"], {"default": "bf16"}),
+                "precision": (["fp32", "fp16", "bf16"], {"default": "fp16"}),
                 "offload_after_upscale": (
                     "BOOLEAN",
                     {
@@ -108,9 +101,12 @@ class MinimaxH3LatentUpscaler3DProvider:
     FUNCTION = "build"
     CATEGORY = "video/MinimaxH3"
     DESCRIPTION = (
-        "Checkpoint/device configuration for one exact-target, clean-video learned latent transform. "
-        "Connect as a side input to compatible progressive handoff nodes; this node performs no "
-        "sampling and never receives H3 audio."
+        "Loads/configures one MiniMax H3 learned-upscaler checkpoint, separately from any node "
+        "that applies it. Connect its 'learned_upscaler' output to the optional input of the same "
+        "name on 'Minimax H3 Latent Upscaler (3D)', 'MiniMax H3 Resize Target Conditioning', or a "
+        "compatible progressive handoff consumer, so every consumer shares the exact same loaded "
+        "checkpoint instead of each one picking model_name/device/precision on its own. This node "
+        "performs no sampling and never receives H3 audio."
     )
 
     def build(self, model_name, device, precision, offload_after_upscale=False):
