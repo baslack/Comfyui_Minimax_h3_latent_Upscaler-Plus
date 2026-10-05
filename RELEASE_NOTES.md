@@ -1,3 +1,59 @@
+# MiniMax H3 Latent Upscaler-Plus v0.2.2
+
+Provide continuous H3 encoder-to-decoder feature transport for the coordinated
+Flow handoff, preserving ordinary learned-upscaling behavior.
+
+## Continuous physical lattice
+
+- Resample the complete dense encoder field before decoder convolutions on
+  coordinates whose adjacent-cell means match native H3 patch centers.
+- Advertise `h3_patch_lattice_api=2` / `h3_dense_patch_center_lattice_v2` so Flow
+  uses the same map for its source-prefix carrier.
+- Avoid the reproduced edge-duplication mechanism from independent even/odd
+  spatial resampling.
+- Preserve ordinary half-pixel upscaling, checkpoint parameter keys,
+  normalization, complete temporal network execution and cache/offload behavior.
+
+Flow's target-grid continuation profile bypasses the checkpoint at the masked
+handoff, while all-generated first chunks still use learned progressive
+transfer. The map tests prove the operator correction; they do not qualify
+heterogeneous trained-checkpoint continuation as visually fixed.
+
+## Coordinated release set
+
+Update the coordinated components together. Every release links this same
+version set and identifies its implementation PRs.
+
+| Component | Release | Included PRs |
+| --- | --- | --- |
+| Flow-Aligned Regenerate | [v0.3.9](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.9) | [#89](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/89), [#93](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/93) |
+| Sol-H3 | [v0.1.8](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.8) | [#37](https://github.com/xmarre/ComfyUI-Sol-H3/pull/37) |
+| VDN-H3-Plus | [v1.5.7](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.7) | [#33](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/33), [#34](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/34), [#35](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/35), [#36](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/36), [#37](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/37) |
+| H3 Continuum-Plus | [v3.4.5](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.5) | [#37](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/37), [#38](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/38) |
+| Latent Upscaler-Plus | [v0.2.2](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/releases/tag/v0.2.2) | [#16](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/pull/16) |
+
+[Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28)
+is the unchanged companion. Separate Keyless, audio-training and rejected
+decoded-geometry experiments are outside this release set.
+
+The tested Core adapter repair is
+[ComfyUI #16783](https://github.com/Comfy-Org/ComfyUI/pull/16783).
+It remains an upstream review item, with upstream workflow approval and merge
+controlled by Comfy-Org maintainers. For INT8 fused MLP runtime adapters,
+retain that ComfyUI Patcher PR overlay until the repair is available upstream.
+The independent Core #16720 optimization is not included in this release set.
+
+---
+
+# Unreleased: continuous H3 transfer
+
+The selected physical handoff path resamples dense encoder cells continuously,
+preserving H3 patch-center coordinates without separating even/odd spatial
+phases. This removes a reproduced edge-duplication mechanism. The capability is
+`h3_patch_lattice_api=2` and requires the matching Flow companion overlay.
+Ordinary upscaling retains its existing interpolation. Trained-checkpoint
+continuity remains under runtime qualification.
+
 # MiniMax H3 Latent Upscaler v0.2.1
 
 v0.2.1 aligns the sampler-internal learned-upscaler provider defaults with the coordinated Flow-Aligned Regenerate progressive workflow.
