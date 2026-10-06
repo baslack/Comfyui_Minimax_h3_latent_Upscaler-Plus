@@ -1,17 +1,313 @@
 <p align="center">
+  <a href="./README.md"><strong>English</strong></a> ·
+  <a href="./README_zh.md">中文</a>
+</p>
 
-## Coordinated H3 releases
+# ComfyUI MiniMax H3 Latent Upscaler-Plus
 
-Update the coordinated components together. Every release links this same
-version set and identifies its implementation PRs.
+Learned spatial upscaling of MiniMax H3 video latents for ComfyUI, with an optional integrated low-sigma H3 refinement pass.
+
+> **Plus fork:** this is the `xmarre`-maintained fork of [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler). It uses the same learned network and checkpoints and adds H3-aware refinement, H3 Continuum interop, a sampler-internal handoff provider and several correctness fixes. Some behavior intentionally differs from upstream; see [Differences from upstream](#differences-from-upstream).
+
+A trained network enlarges the 24-channel H3 video latent directly, so a two-stage workflow can generate at a lower resolution, upscale in latent space and refine briefly at the target resolution without a VAE decode → pixel upscale → VAE encode round trip. Audio never passes through the upscaler.
+
+The learned upscale saves time. It does not reduce the VRAM needed by a later H3 pass, which still runs the transformer on the full target-resolution grid.
+
+**Examples:** [video comparison (MP4)](examples/Minimax_h3_latent_Upscaler_001.mp4)
+
+![Image upscale comparison](examples/Minimax_h3_latent_Upscaler_002.jpg)
+
+## Contents
+
+- [Nodes](#nodes)
+- [Installation](#installation)
+- [Workflows](#workflows)
+- [Behavior](#behavior)
+- [Node reference](#node-reference)
+- [Provider API](#provider-api)
+- [Model and training data](#model-and-training-data)
+- [Differences from upstream](#differences-from-upstream)
+- [Testing](#testing)
+- [Coordinated H3 release set](#coordinated-h3-release-set)
+- [Acknowledgments](#acknowledgments)
+
+## Nodes
+
+All nodes are in the `video/MinimaxH3` category.
+
+| Display name | Node ID | Purpose |
+| --- | --- | --- |
+| Minimax H3 Latent Upscaler (2D) | `MinimaxH3LatentUpscalerNode2D` | Learned upscale with a 2D backbone and temporal layers. Multiplier sizing only. |
+| Minimax H3 Latent Upscaler (3D) | `MinimaxH3LatentUpscaler3D` | Fully 3D learned upscale. Multiplier, target-dimension or megapixel sizing with dual-axis alignment. |
+| MiniMax H3 Latent Upscaler + Refine (3D) | `MinimaxH3LatentUpscaler3DRefineHandoff` | Learned 3D upscale followed by the H3 refinement sampling pass. Returns a decode-ready LATENT. Handles native joint AV latents and H3 Continuum chunk lists. |
+| MiniMax H3 Latent Upscaler Provider (3D) [Experimental] | `MinimaxH3LatentUpscaler3DProvider` | Configuration object for sampler-internal learned handoffs, such as Flow-Aligned Regenerate's `learned_3d` transfer. Performs no sampling. |
+
+The 2D and 3D nodes are plain `LATENT → LATENT` upscalers. They do not run H3.
+
+## Installation
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus.git Comfyui_Minimax_h3_latent_Upscaler
+```
+
+Restart ComfyUI afterwards. The only dependency outside a standard ComfyUI install is `einops`, which ComfyUI already ships with.
+
+### Checkpoints
+
+Place checkpoints in `ComfyUI/models/latent_upscale_models/`. The folder is registered automatically and scanned non-recursively for `.safetensors` and `.pth` files.
+
+Pre-trained checkpoints: [huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
+
+| File | Stored precision |
+| --- | --- |
+| `minimax_h3_latent_upscaler_3d_bf16.safetensors` | bf16 |
+| `minimax_h3_latent_upscaler_3d_fp16.safetensors` | fp16 |
+| `minimax_h3_latent_upscaler_3d_fp32.pth` | fp32 |
+
+These files share one 3D architecture and serve the 3D, Refine and Provider nodes. The Provider preselects the bf16 file when it is present. The `precision` widget sets the inference dtype independently of the stored precision.
+
+The loaders detect block counts, channel width and temporal layers from the checkpoint. The 2D node needs a checkpoint with the 2D backbone layout; a 3D checkpoint fails in the 2D node with a missing-weights error.
+
+## Workflows
+
+### Standalone upscale
+
+The 2D and 3D nodes take a plain 24-channel video latent (`B×24×T×H×W`, or `B×24×H×W` for a single frame). Split a joint H3 audio-video latent first and recombine it afterwards:
+
+```text
+joint H3 AV latent
+  → LTXVSeparateAVLatent
+      video_latent → Minimax H3 Latent Upscaler (3D) ─┐
+      audio_latent ───────────────────────────────────┤
+  → LTXVConcatAVLatent
+  → second H3 pass of your choice, or VAE Decode
+```
+
+The workflows in [`workflow_templates/`](workflow_templates/) use this pattern for image-to-video and reference-to-video, followed by an external second pass with `BasicGuider` and `SamplerCustomAdvanced`.
+
+### Upscale and refine in one node
+
+**MiniMax H3 Latent Upscaler + Refine (3D)** replaces the split/upscale/concat/second-sampler chain:
+
+```text
+low-resolution H3 latent ─► MiniMax H3 Latent Upscaler + Refine (3D) ─► VAE Decode
+                              + noise    (RandomNoise)
+                              + sampler  (KSamplerSelect)
+                              + sigmas   (partial-denoise schedule, sigmas[0] < 1)
+                              + model + positive   (native workflows)
+                                or refine_state    (H3 Continuum)
+```
+
+For a native workflow, connect the joint AV `latent`, `model` and `positive`. Leave `audio_latent` disconnected. `negative` is optional. Without it the node samples with positive-only guidance, which is the usual H3 setup. With it the node uses CFG at `cfg`.
+
+Do not add an external `BasicGuider`, `DisableNoise` or `SamplerCustomAdvanced`. The node runs the sampling pass itself.
+
+### H3 Continuum
+
+Connect the parallel chunk-list outputs of **H3 Continuum Sampler V3.4** from [H3 Continuum-Plus](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus):
+
+```text
+H3 Continuum Sampler V3.4
+  video_latents ──► Refine.latent
+  audio_latents ──► Refine.audio_latent
+  refine_state  ──► Refine.refine_state
+```
+
+Connecting `refine_state` makes Continuum capture, per chunk, a fresh MODEL clone carrying that chunk's Continuum options and the exact positive conditioning that sampler 1 received. Continuum also attaches each chunk's video/audio denoise masks to the latent outputs. A connected `refine_state` takes precedence: leftover `model`, `positive` or `negative` connections are ignored, and a malformed state raises an error instead of falling back to them.
+
+The node consumes the whole chunk list in order. When a chunk begins with a fully protected continuation prefix (denoise mask 0 over whole time steps), that prefix is replaced by the final time steps of the previous chunk's *refined* output before sampler 2 runs, so consecutive chunks join on the refined content rather than on independently upscaled copies. Audio prefixes are carried the same way when `lock_audio` is off. Carrying requires identical video geometry across chunks.
+
+Run Storage does not persist refinement state. If Continuum reuses stored chunks while `refine_state` is connected, it raises an error. Disable Run Storage or regenerate from chunk 1.
+
+### Sampler-internal handoff (experimental)
+
+**MiniMax H3 Latent Upscaler Provider (3D)** outputs an `H3_LATENT_UPSCALER` object. Connect it to a consumer that accepts one, such as the Target Input progressive handoff of [MiniMax-H3 Flow-Aligned Regenerate](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate), and select that consumer's learned transfer mode (`learned_3d`). The consumer calls the provider once per handoff on its clean video estimate at an exact target latent size. The provider never receives audio and runs no H3 steps. Recommended handoff settings are documented by the consumer.
+
+## Behavior
+
+### Output size and alignment
+
+The 3D and Refine nodes compute a pixel-space target from the selected mode:
+
+- `scale by multiplier`: source size × `scale`.
+- `target dimensions`: `width` × `height`.
+- `megapixels`: `megapixels × 1024²` pixels at the source aspect ratio.
+
+`align` is a pixel-space requirement. H3's VAE also needs a 16-pixel grid, so both axes are placed on `lcm(align, 16)`. The default `align=32` gives a 32-pixel grid. `align=24` gives a 48-pixel grid.
+
+- `keep_proportion=False` rounds width and height to the grid independently.
+- `keep_proportion=True` searches nearby grid pairs and picks the one that best preserves the source aspect ratio while staying close to the target. Both axes stay on the grid.
+
+Only upscaling is supported. A target smaller than the source on either axis is rejected. If the result equals the source size, the latent is returned unchanged.
+
+The 2D node scales the latent grid by `scale` with rounding and does no pixel-grid alignment.
+
+### Refinement pass
+
+The Refine node:
+
+1. upscales only the video member with the learned 3D network;
+2. optionally moves the learned model to CPU (`offload_after_upscale`);
+3. rebuilds the joint H3 AV latent on the enlarged grid;
+4. rebuilds the denoise mask on the enlarged grid (see [Audio and masks](#audio-and-masks));
+5. resizes target-grid conditioning (see [Conditioning geometry](#conditioning-geometry));
+6. generates fresh noise from `noise` for the enlarged AV grid;
+7. runs the supplied `sampler` over `sigmas` with ComfyUI's standard guider path. ComfyUI applies the model's own noise scaling, so there is no manual pre-noising and no `DisableNoise` stage.
+
+`sigmas[0]` must satisfy `0 <= sigmas[0] < 1`. Under H3's flow parameterization, a schedule that starts at 1.0 gives the upscaled latent zero weight, so such a schedule is rejected. Use a partial-denoise schedule. An empty `SIGMAS` returns the upscaled latent without sampling.
+
+Sampler 2 runs on a clone of the MODEL whose `transformer_options["h3_refinement"]` marks the call as a refinement pass (API 1, `sigma_reference` = the model's `sigma_max`). Companion runtime patches read this contract, so they treat sampler 2 as a refinement pass rather than a fresh generation. The source MODEL is not modified.
+
+Sampler 2 cost scales with the target token count. A 2× spatial upscale gives about four times as many video tokens per H3 step. Keep the refinement schedule short, and benchmark it on your hardware.
+
+### Audio and masks
+
+`lock_audio` (default on):
+
+- **On**: audio noise is zero, the audio denoise mask is zero, and pass-1 audio is restored exactly after sampling.
+- **Off**: audio receives normal noise and is refined with the video. An existing audio denoise mask is kept.
+
+An existing video denoise mask is resized to the enlarged grid with nearest-neighbour sampling. Fully protected regions therefore stay protected, and a Native-Masked continuation prefix is not re-denoised. When no mask exists and `lock_audio` is off, the node samples without a mask.
+
+### Conditioning geometry
+
+- `minimax_keyframes` are target-grid conditions. They are resized to H3's internally padded even latent grid (H3 pads H/W to its 2×2 patch grid).
+- `minimax_refs` are independent reference blocks with their own latent size and RoPE grid. They are left unchanged.
+- Conditioning is copied, never mutated. Container types and extra fields are preserved.
+
+The upscaled latent itself keeps the exact learned output shape. H3 crops its padding back internally.
+
+### Model cache, devices and offload
+
+- Loaded networks are cached per `(checkpoint, device, precision)` and reused across runs.
+- `offload_after_upscale` (3D, Refine and Provider; default off) moves the cached network to CPU after use. The next use moves it back. On the Refine node, offload happens after the upscale and before sampler 2, which is where reclaiming VRAM matters most. Leave it off when VRAM allows, because every run then pays the transfer.
+- The 2D, 3D and Refine nodes fall back to CPU when CUDA is unavailable. The Provider raises an error instead, because it never changes device silently.
+- The 3D network always processes the full temporal sequence in one pass. It is never split into temporal chunks.
+- Attention layers in the learned network are disabled at inference.
+
+## Node reference
+
+### Minimax H3 Latent Upscaler (2D)
+
+| Input | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `latent` | LATENT | | 24-channel video latent |
+| `model_name` | combo | | 2D-backbone checkpoint |
+| `scale` | FLOAT | 2.0 | 1.0–4.0 |
+| `device` | combo | `cuda` | `cuda`, `cpu` |
+| `precision` | combo | `fp32` | `fp32`, `fp16`, `bf16` |
+
+Output: `LATENT`.
+
+### Minimax H3 Latent Upscaler (3D)
+
+| Input | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `latent` | LATENT | | 24-channel video latent, 5D or 4D |
+| `model_name` | combo | | 3D checkpoint |
+| `mode` | combo | `scale by multiplier` | reveals `scale` (1.0–4.0), `width`/`height` (64–4096) or `megapixels` (0.1–8.0) |
+| `align` | INT | 32 | pixel alignment, combined as `lcm(align, 16)` |
+| `keep_proportion` | BOOLEAN | true | |
+| `device` | combo | `cuda` | `cuda`, `cpu` |
+| `precision` | combo | `fp16` | `fp32`, `fp16`, `bf16` |
+| `offload_after_upscale` | BOOLEAN | false | |
+
+Defaults for size inputs: `scale` 2.0, `width` 1280, `height` 704, `megapixels` 1.0. Output: `LATENT`.
+
+### MiniMax H3 Latent Upscaler + Refine (3D)
+
+Takes the 3D node's `model_name`, `mode`, `scale`, `width`, `height`, `megapixels`, `align`, `keep_proportion`, `device`, `precision` (default `fp16`) and `offload_after_upscale`. All size inputs are shown, and only those used by the selected `mode` take effect. Additional inputs:
+
+| Input | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `latent` | LATENT | yes | native joint AV latent, or the video latent for split input |
+| `noise` | NOISE | yes | e.g. `RandomNoise` |
+| `sampler` | SAMPLER | yes | e.g. `KSamplerSelect` |
+| `sigmas` | SIGMAS | yes | partial-denoise schedule, `sigmas[0] < 1` |
+| `lock_audio` | BOOLEAN | yes | default true |
+| `cfg` | FLOAT | yes | default 1.0; used only when `negative` is connected on the native path |
+| `audio_latent` | LATENT | split input only | required when `latent` holds only video; must be disconnected for a joint AV latent |
+| `refine_state` | H3_CONTINUUM_REFINE_STATE | Continuum | takes precedence over `model`/`positive`/`negative` |
+| `model` | MODEL | native | required without `refine_state` |
+| `positive` | CONDITIONING | native | required without `refine_state` |
+| `negative` | CONDITIONING | no | native path only; enables CFG |
+
+Output: `LATENT` list, final and decode-ready. A single latent input yields a one-item list.
+
+### MiniMax H3 Latent Upscaler Provider (3D) [Experimental]
+
+| Input | Type | Default |
+| --- | --- | --- |
+| `model_name` | combo | `minimax_h3_latent_upscaler_3d_bf16.safetensors` when present |
+| `device` | combo | `cuda` |
+| `precision` | combo | `bf16` |
+| `offload_after_upscale` | BOOLEAN | false |
+
+Output: `H3_LATENT_UPSCALER`.
+
+## Provider API
+
+The `H3_LATENT_UPSCALER` value is an immutable `H3LatentUpscalerProvider` (`nodes/minimax_h3_handoff_provider.py`). It holds configuration only. Checkpoint loading and the model cache stay inside this package.
+
+| Attribute | Value |
+| --- | --- |
+| `kind` | `"minimax_h3_learned_latent_upscaler"` |
+| `api_version` | `1` |
+| `h3_patch_lattice_api` | `2` |
+| `model_name`, `device`, `precision`, `offload_after_upscale` | node inputs |
+
+- `upscale_clean_video(video, *, target_h, target_w)` takes a clean floating-point `B×24×T×H×W` video latent and returns it at exactly `target_h × target_w` with batch, channels, time and dtype preserved. Shrinking either axis is rejected, and non-finite results raise an error.
+- `upscale_clean_video_h3_patch_lattice(video, *, target_h, target_w)` runs the same network but resamples the dense encoder features on coordinates whose adjacent-cell means are H3's native patch centers (`h3_dense_patch_center_lattice_v2`), before the decoder. It requires even spatial axes. It exists for consumers that must match H3's patch-coordinate map at a handoff. The ordinary node and provider paths keep the trained half-pixel interpolation. Background: [`docs/TRANSFER_LATTICE_20261004.md`](docs/TRANSFER_LATTICE_20261004.md).
+
+## Model and training data
+
+- **Input:** 24-channel H3 video latent, normalized with the training per-channel statistics before inference and denormalized afterwards.
+- **3D architecture (default configuration; the loader reads the actual values from the checkpoint):** `in_channels=24`, 12 encoder and 12 decoder residual blocks with 512 channels, a temporal convolution (kernel 5) after every second residual block, and a learned scale embedding.
+- **Resampling:** trilinear between encoder and decoder in the 3D network, bilinear in the 2D network. The time axis is preserved and only H×W are scaled.
+
+The upstream checkpoints were trained on about 80,000 paired samples (low-resolution latent and high-resolution target):
+
+| Modality | Pairs | Share |
+| --- | --- | --- |
+| Video clips | ~70,000 | ~87.5% |
+| 2K images | ~8,000 | ~10% |
+
+| Scale | Share |
+| --- | --- |
+| 2× | 40% |
+| 1.5×, 2.5×, 3×, 4× | 10% each |
+| arbitrary 1.0×–4.0× | 10% |
+
+## Differences from upstream
+
+Upstream changes are reviewed and adopted selectively. The current intentional differences:
+
+- **No temporal chunking.** The 3D network runs once over the full sequence. Its stacked 3D/temporal convolutions and GroupNorm statistics span time, so chunked execution with partial overlap is not equivalent to full-sequence execution and can introduce boundary differences.
+- **Offload is opt-in.** `offload_after_upscale` defaults to off instead of unloading after every run, which avoids repeated transfers on repeated or high-VRAM runs.
+- **Dual-axis alignment keeps `keep_proportion`.** Both axes are aligned on `lcm(align, 16)` while aspect-ratio lock is retained.
+- **Normalization stays in place** on a private copy. Out-of-place arithmetic in the same dtype would add full-size temporaries without changing numerical precision.
+- **H3-specific additions** that upstream does not have: the Refine node, Continuum interop and the handoff Provider.
+
+## Testing
+
+GitHub Actions runs on pushes to `main` and on pull requests, against several pinned ComfyUI source revisions with Python 3.12, and on one revision with Python 3.10, 3.11 and 3.13. Each job runs Ruff and `compileall`, native ComfyUI source-contract tests, and the regression suite.
+
+The suite covers native and split AV validation, learned-upscaler delegation, exact output geometry and alignment, keyframe and reference conditioning, denoise-mask reconstruction, Continuum `refine_state` resolution and precedence, sequential chunk-prefix carry, guider and sampler invocation, the partial-denoise guard, locked-audio restoration, full-sequence execution, cache device restore, offload placement, the provider contract and the H3 patch-lattice transform.
+
+The tests do not load trained weights. Output quality, speed and peak VRAM depend on the workload and hardware and have to be checked in real workflows.
+
+## Coordinated H3 release set
+
+This package is released together with the other H3 components. Per-version details are in [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 | Component | Release | Included PRs |
 | --- | --- | --- |
-| Flow-Aligned Regenerate | [v0.3.9](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.9) | [#89](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/89), [#93](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/93) |
-| Sol-H3 | [v0.1.8](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.8) | [#37](https://github.com/xmarre/ComfyUI-Sol-H3/pull/37) |
-| VDN-H3-Plus | [v1.5.7](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.7) | [#33](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/33), [#34](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/34), [#35](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/35), [#36](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/36), [#37](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/37) |
-| H3 Continuum-Plus | [v3.4.5](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.5) | [#37](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/37), [#38](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/38) |
-| Latent Upscaler-Plus | [v0.2.2](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/releases/tag/v0.2.2) | [#16](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/pull/16) |
+| Flow-Aligned Regenerate | [v0.3.10](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.10) | [#96](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/96) |
+| Sol-H3 | [v0.1.9](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.9) | [#39](https://github.com/xmarre/ComfyUI-Sol-H3/pull/39) |
+| VDN-H3-Plus | [v1.5.8](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.8) | [#38](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/38) |
+| H3 Continuum-Plus | [v3.4.6](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.6) | [#39](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/39), [#40](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/40) |
+| Latent Upscaler-Plus | [v0.2.2](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/releases/tag/v0.2.2) | unchanged |
 
 [Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28)
 is the unchanged companion. Separate Keyless, audio-training and rejected
@@ -19,428 +315,13 @@ decoded-geometry experiments are outside this release set.
 
 The tested Core adapter repair is
 [ComfyUI #16783](https://github.com/Comfy-Org/ComfyUI/pull/16783).
-It remains an upstream review item, with upstream workflow approval and merge
-controlled by Comfy-Org maintainers. For INT8 fused MLP runtime adapters,
-retain that ComfyUI Patcher PR overlay until the repair is available upstream.
-The independent Core #16720 optimization is not included in this release set.
-
-  <a href="./README.md"><strong>English</strong></a> ·
-  <a href="./README_zh.md">中文</a>
-</p>
-
-<div align="center">
-
-# ComfyUI Minimax H3 Latent Upscaler-Plus
-
-> **Plus fork:** This is the `xmarre` maintained Plus fork of [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler). It preserves the upstream project's foundation while carrying additional features, integrations, fixes, and behavior that may intentionally diverge from upstream.
-
-**Neural Latent Upscaler for Minimax H3 Video Generation**  
-Learned · High-fidelity · 2D & 3D Variants
-
-</div>
-
-## 📰 News
-
-- [2026-09-04] 🔁 **Sampler-internal learned handoff provider**: added an API-v1 exact-target 3D clean-video provider for Flow-Aligned Regenerate progressive handoff. Real-media validation showed strong artifact reduction around 1 MP with zero extra H3 NFEs; `source_scale=0.70` was the best tested quality/speed point around 1 MP, while `0.65` began losing likeness/tonal stability.
-- [2026-08-21] 🔧 **Selective LBH upstream sync**: fixed dual-axis output alignment while preserving aspect-ratio lock, added opt-in learned-model offload for standalone and integrated refinement workflows, and deliberately rejected non-equivalent temporal chunking / forced per-run offload. See [Upstream sync policy](#upstream-sync-policy).
-- [2026-08-20] 🧩 **Integrated MiniMax H3 refinement**: the H3-aware 3D node now performs the complete learned-upscale + low-sigma H3 sampling pass internally. H3 Continuum V3.4 interop uses exact per-chunk `refine_state` from the companion Continuum implementation; no external BasicGuider, DisableNoise, or SamplerCustomAdvanced is required.
-- [2026-08-19] 🚀 **3D node overhaul**: all three resize modes (`scale by multiplier`, `target dimensions`, `megapixels`) merged into a single node; fixed aspect-ratio mismatch in certain modes and edge artifacts at specific sizes.
-- [2026-08-18] 🔥 **Precision selector**: both 2D and 3D nodes support `fp32` / `fp16` / `bf16` inference.
-- [2026-08-17] 🎉 **Initial release**: Minimax H3 Latent Upscaler 2D + 3D nodes.
-
-This project upscales **MiniMax H3** 24-channel video latents with a trained neural network instead of naive interpolation. It can skip the expensive VAE decode → pixel upscale → VAE encode round-trip and supports a two-stage generation strategy: generate at lower resolution, perform the learned latent upscale, then optionally run a short H3 refinement pass at the target resolution.
-
-> The learned upscale saves time, not VRAM. Any H3 refinement pass still executes the transformer on the target-resolution latent grid.
-
-## Nodes
-
-Four nodes are registered under `video/MinimaxH3`:
-
-- **Minimax H3 Latent Upscaler (2D)** — lightweight learned spatial upscale with temporal layers.
-- **Minimax H3 Latent Upscaler (3D)** — fully 3D learned upscale with scale, target-dimensions, and megapixel modes.
-- **MiniMax H3 Latent Upscaler + Refine (3D)** — complete MiniMax H3 two-stage path: learned video upscale, AV reconstruction, exact H3 conditioning/masks, fresh enlarged-grid noise, and the actual second sampling pass.
-- **MiniMax H3 Latent Upscaler Provider (3D) [Experimental]** — immutable, versioned side-input configuration for compatible sampler-internal handoffs.
-
-The standalone 2D/3D nodes remain ordinary `LATENT → LATENT` upscalers. The integrated refine node is for workflows that intentionally perform a second H3 pass.
-
----
-
-## 📸 Examples
-
-**Video upscale comparison**
-
-<video src="examples/Minimax_h3_latent_Upscaler_001.mp4" controls width="640"></video>
-
-**Image upscale comparison**
-
-![](examples/Minimax_h3_latent_Upscaler_002.jpg)
-
----
-
-## 📁 Project Structure
-
-```text
-Comfyui_Minimax_h3_latent_Upscaler/
-├── .github/workflows/tests.yml
-├── examples/
-│   ├── Minimax_h3_latent_Upscaler_001.mp4
-│   └── Minimax_h3_latent_Upscaler_002.jpg
-├── workflow_templates/
-│   └── minimax_h3_r2v_Latent Upscaler example workflow.json
-├── nodes/
-│   ├── __init__.py
-│   ├── minimax_h3_latent_upscaler_2d.py
-│   ├── minimax_h3_latent_upscaler_3d.py
-│   ├── minimax_h3_handoff_provider.py    # versioned exact-target side-input API
-│   ├── minimax_h3_refine_support.py       # H3 AV/mask/conditioning helpers
-│   └── minimax_h3_refine.py               # complete H3 learned-upscale + refinement
-├── tests/
-│   ├── conftest.py
-│   ├── test_h3_refine_node.py
-│   ├── test_h3_refine_sequence.py
-│   ├── test_h3_refine_support.py
-│   ├── test_handoff_provider.py
-│   ├── test_native_comfyui_fixture.py
-│   └── test_upstream_sync.py
-├── README.md
-├── README_zh.md
-└── __init__.py
-```
-
-The model weights are not included in this repository.
-
----
-
-## 🚀 Key Features
-
-- **Learned latent upscaling** instead of bilinear/bicubic latent interpolation.
-- **Two learned backbones**: fast 2D and temporally coherent 3D.
-- **Integrated H3 refinement**: the H3-aware node performs the second sampler internally and returns a final decode-ready LATENT.
-- **Exact H3 Continuum V3.4 interop** with the companion `ComfyUI-H3-Continuum` refinement-state output.
-- **Native AV handling**: only video is spatially upscaled; audio is preserved or deliberately refined.
-- **Exact target-conditioning geometry**: target `minimax_keyframes` follow H3's padded target grid while independent `minimax_refs` retain their own latent/RoPE grids.
-- **Native-Masked continuation safety**: exact per-chunk video/audio denoise masks are retained and the protected prefix is not accidentally re-denoised.
-- **Dual-axis output alignment**: 3D output dimensions use a common pixel grid compatible with both the requested `align` value and H3's 16× VAE grid.
-- **Aspect-ratio-aware sizing**: `keep_proportion=True` remains supported; the 3D node chooses a nearby valid aligned W/H pair rather than fixing alignment by independently distorting both axes.
-- **Memory-conscious checkpoint loading**: direct safetensors loading to the selected device/precision, meta-device construction, `load_state_dict(assign=True)`, reduced input cloning, and model caching.
-- **Optional learned-model offload**: `offload_after_upscale` can free the learned 3D upscaler after inference; it is deliberately **off by default** to avoid repeated CPU↔GPU transfers on high-VRAM/repeated workflows.
-- **Flexible output sizing**: multiplier, target dimensions, or megapixels on the 3D nodes.
-- **Flexible precision/device**: CUDA/CPU and fp32/fp16/bf16.
-
-Inference forces learned-upscaler attention off (`attn=False`) for speed/stability. Loaded learned models are cached by `(name, device, precision)`. If an optionally offloaded cached model is used again, it is moved back to the requested device before inference.
-
----
-
-## 📦 Installation
-
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus.git Comfyui_Minimax_h3_latent_Upscaler
-```
-
-A normal ComfyUI installation already provides the main runtime dependencies (`torch`, `einops`, `safetensors`). Restart ComfyUI after installing or updating the node.
-
-### Model placement
-
-Put the learned upscaler checkpoint in:
-
-```text
-ComfyUI/models/latent_upscale_models/
-```
-
-Pre-trained checkpoints are available from:
-
-https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler
-
-The loader auto-detects the stored architecture.
-
----
-
-## 🧩 Usage
-
-### Standalone latent upscale
-
-```text
-MiniMax H3 latent
-→ Minimax H3 Latent Upscaler (2D or 3D)
-→ VAE Decode
-```
-
-This path does **not** run another H3 transformer pass.
-
-For the 3D node, enable `offload_after_upscale` only when reclaiming the learned upscaler's VRAM matters more than avoiding a later CPU→GPU reload. The default is `False`.
-
-### Integrated native H3 refinement
-
-For a native joint H3 AV LATENT:
-
-```text
-clean low-resolution joint H3 AV latent
-             │
-             ▼
-MiniMax H3 Latent Upscaler + Refine (3D)
-  + MODEL
-  + positive CONDITIONING
-  + RandomNoise
-  + KSamplerSelect
-  + partial-denoise SIGMAS
-             │
-             ▼
-      final H3 LATENT
-             │
-             ▼
-         VAE Decode
-```
-
-`negative` remains optional for deliberate CFG-style workflows on the explicit native fallback path. Native MiniMax H3 normally uses positive-only BasicGuider semantics; the integrated node constructs that guider internally when `negative` is not connected.
-
-On the integrated path, `offload_after_upscale=True` moves the cached learned 3D upscaler to CPU **after the learned upscale and before sampler 2**. This can reduce peak residency when sampler 2 needs the target-resolution H3 transformer, but it remains opt-in because repeated runs otherwise pay the model reload/transfer cost every time.
-
-### H3 Continuum V3.4 refinement
-
-Use the companion H3 Continuum PR/release that exposes `refine_state`:
-
-https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/15
-
-Correct wiring:
-
-```text
-H3 Continuum Sampler V3.4
-  video_latents -----> MiniMax H3 Latent Upscaler + Refine.latent
-  audio_latents -----> MiniMax H3 Latent Upscaler + Refine.audio_latent
-  refine_state ------> MiniMax H3 Latent Upscaler + Refine.refine_state
-
-RandomNoise ---------> MiniMax H3 Latent Upscaler + Refine.noise
-KSamplerSelect ------> MiniMax H3 Latent Upscaler + Refine.sampler
-partial SIGMAS ------> MiniMax H3 Latent Upscaler + Refine.sigmas
-
-MiniMax H3 Latent Upscaler + Refine.latent
-  -------------------> VAE Decode / downstream assembly
-```
-
-**Do not add an external BasicGuider, DisableNoise, or SamplerCustomAdvanced.** The integrated node performs that sampling stage itself.
-
-The Continuum `video_latents`, `audio_latents`, and `refine_state` outputs are parallel lists. ComfyUI maps corresponding chunk indices together.
-
-A valid Continuum `refine_state` is authoritative. If an upgraded workflow still has old `model`, `positive`, or `negative` fallback wires attached, those manual conditioning inputs are ignored. Invalid/malformed `refine_state` still fails closed instead of silently falling back to the stale connections.
-
-### What `refine_state` contains
-
-A correct Continuum second pass needs more than the sampled tensors. For each chunk, `refine_state` supplies:
-
-- a fresh MODEL clone preserving the exact chunk-specific Continuum model options/context hint and a fresh Continuum APPLY_MODEL wrapper;
-- the exact positive CONDITIONING object that sampler 1 actually received.
-
-If Native Masked continuation used an AV denoise mask, Continuum also attaches the exact video/audio mask members to the matching split LATENT outputs. The integrated upscaler resizes only the target video mask to the enlarged grid and preserves the audio mask.
-
-This is why a separate generic `MiniMaxH3ImageToVideo` conditioning node or unrelated raw H3 MODEL is not considered equivalent to Continuum's real per-chunk state.
-
-### Run Storage
-
-Raw runtime MODEL/CONDITIONING state is deliberately not persisted in H3 Continuum Run Storage. If `refine_state` is requested and Continuum reuses an old chunk prefix, Continuum fails closed rather than pairing new runtime state with reused latents.
-
-For an exact refinement run use either:
-
-- `Run Storage = Off`, or
-- regenerate from Chunk 1 so every output chunk is sampled in the current execution.
-
-### Sampling semantics
-
-The integrated node follows ComfyUI's normal advanced-sampler contract:
-
-1. perform the learned video upscale;
-2. optionally offload the learned 3D upscaler when `offload_after_upscale=True`;
-3. rebuild clean high-resolution joint H3 AV state;
-4. generate independent fresh noise directly on that enlarged AV grid;
-5. build the positive-only H3 guider for Continuum, or an optional CFG guider on the explicit native fallback when `negative` is connected;
-6. call the supplied ComfyUI `SAMPLER` with the clean latent, generated noise, supplied `SIGMAS`, and denoise mask;
-7. let ComfyUI perform the model's normal `model_sampling.noise_scaling(...)` internally;
-8. return the sampler result as the final LATENT.
-
-There is **no manual pre-noising/inverse-noise handoff** and therefore no `DisableNoise` stage.
-
-Because a full-noise start gives the clean learned latent zero weight for H3's CONST parameterization, the refinement node requires:
-
-```text
-0 <= sigmas[0] < 1
-```
-
-A full-denoise schedule beginning at `1.0` is rejected. Use a partial-denoise second-pass schedule.
-
-The exact optimal refinement schedule is workload-dependent. A short pass is the intended use; even a short 2× spatial refinement can still be expensive because doubling latent H and W produces roughly four times as many video tokens for every H3 transformer step. Benchmark the second pass on your hardware rather than treating the learned upscaler itself as the dominant cost.
-
-### Progressive handoff provider (experimental)
-
-Connect **MiniMax H3 Latent Upscaler Provider (3D) [Experimental]** to a compatible
-`H3_LATENT_UPSCALER` input, such as Flow-Aligned Regenerate's Target Input progressive handoff,
-and select that consumer's learned transfer mode. The provider applies exactly one learned 3D
-transform to the consumer's clean `B×24×T×H×W` video estimate at the geometry boundary. It accepts
-the consumer's already-resolved exact latent H/W, preserves batch/channels/time, and never receives
-audio or runs H3 sampling.
-
-The provider uses the same package-owned checkpoint cache and precision/device policy as the 3D
-node. `offload_after_upscale=False` remains the default; enable it only when reclaiming VRAM is worth
-the transfer cost on every physical chunk. The training distribution includes arbitrary 1–4× scales,
-but sampler-internal handoff quality still has to be established by decoded media rather than by the
-training range alone.
-
-In the coordinated Flow-Aligned Regenerate path, learned transfer is now decoded-media validated at
-aggressive progressive transitions. Around a 0.995 MP target, replacing bicubic with `learned_3d` at
-roughly 54×40→72×54 latent geometry fixed the majority of the observed handoff artifacts in the tested
-prompt. `source_scale=0.70` resolved to 800×608→1152×864 and was judged excellent; `0.65` resolved to
-736×576→1152×864 and began losing reference likeness / tonal stability. A later 0.70 run resolved to
-832×640→1184×896 (~1.061 MP target) and was again judged very good, although the generated action was
-different. The BF16 provider added only about 0.6–0.9 s of learned inference per physical chunk and
-zero H3 NFEs in these runs. This is evidence for the coordinated progressive boundary, not a universal
-quality claim for every consumer or prompt.
-
-### Audio control
-
-`lock_audio` has two states:
-
-- **True** — preserve pass-1 audio exactly, zero audio refinement noise, use an audio denoise mask of zero, and restore the clean pass-1 audio after sampling.
-- **False** — generate normal H3 audio noise and allow sampler 2 to refine/remix audio while preserving any existing audio denoise mask.
-
-Audio never enters the learned spatial upscaler.
-
-### Conditioning geometry
-
-- `minimax_keyframes` are target-grid conditions and are resized to H3's internally padded even latent H/W.
-- `minimax_refs` are independent reference blocks with their own latent dimensions/RoPE grids and are deliberately left unchanged.
-- conditioning metadata is cloned rather than mutated;
-- list/tuple container type and additional entry fields are preserved.
-
-### 3D alignment semantics
-
-The `align` value is a **pixel-space** requirement. H3's VAE also requires a 16× pixel grid. The 3D node therefore uses the common grid:
-
-```text
-alignment_grid = lcm(align, 16)
-```
-
-For the default `align=32`, both output axes are therefore 32-pixel aligned. For a non-divisor such as `align=24`, both axes are aligned to 48 pixels so they satisfy both requirements.
-
-With `keep_proportion=False`, width and height are rounded independently on this common grid. With `keep_proportion=True`, the node searches nearby valid grid pairs and selects the result that best preserves the source aspect ratio while staying close to the requested target. It does **not** make one axis valid and leave the other axis only VAE-aligned, and it does not solve the problem by silently stretching the image.
-
----
-
-## Node Reference — 2D
-
-| Parameter | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `latent` | LATENT | — | Input MiniMax H3 latent |
-| `model_name` | dropdown | auto | Checkpoint in `latent_upscale_models/` |
-| `scale` | FLOAT | 2.0 | Spatial upscale factor, 1.0–4.0 |
-| `device` | dropdown | cuda | cuda / cpu |
-| `precision` | dropdown | fp32 | fp32 / fp16 / bf16 |
-
-Output: final learned-upscaled `LATENT`.
-
-## Node Reference — 3D
-
-| Parameter | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `latent` | LATENT | — | Input MiniMax H3 latent |
-| `model_name` | dropdown | auto | Checkpoint in `latent_upscale_models/` |
-| `mode` | dropdown | scale by multiplier | multiplier / target dimensions / megapixels |
-| `scale` | FLOAT | 2.0 | 1.0–4.0 in multiplier mode |
-| `width` / `height` | INT | 1280 / 704 | target pixel size |
-| `megapixels` | FLOAT | 1.0 | target megapixel budget |
-| `align` | INT | 32 | requested pixel-grid alignment; combined with the 16× H3 VAE grid via `lcm(align, 16)` |
-| `keep_proportion` | BOOLEAN | True | preserve source aspect ratio while choosing a nearby valid dual-axis aligned size |
-| `offload_after_upscale` | BOOLEAN | False | move the cached learned 3D model to CPU after inference to reclaim VRAM; later reuse moves it back to the requested device |
-| `device` | dropdown | cuda | cuda / cpu |
-| `precision` | dropdown | fp16 | fp32 / fp16 / bf16 |
-
-Output: final learned-upscaled `LATENT`.
-
-## Node Reference — MiniMax H3 Latent Upscaler + Refine (3D)
-
-The integrated node includes the same learned 3D sizing/model/device/precision controls and adds:
-
-| Parameter | Type | Required? | Description |
-| :--- | :--- | :---: | :--- |
-| `noise` | NOISE | yes | fresh enlarged-grid refinement noise |
-| `sampler` | SAMPLER | yes | actual sampler executed internally |
-| `sigmas` | SIGMAS | yes | partial-denoise second-pass schedule |
-| `offload_after_upscale` | BOOLEAN | yes | defaults to `False`; when enabled, offloads the learned 3D model before sampler 2 |
-| `audio_latent` | LATENT | no* | matching audio stream for split H3/Continuum input |
-| `refine_state` | H3_CONTINUUM_REFINE_STATE | no** | preferred authoritative Continuum model + conditioning contract |
-| `model` | MODEL | no** | native/non-Continuum fallback MODEL; ignored when `refine_state` is connected |
-| `positive` | CONDITIONING | no** | native/non-Continuum fallback positive conditioning; ignored when `refine_state` is connected |
-| `negative` | CONDITIONING | no | optional native-fallback CFG input; ignored when `refine_state` is connected |
-| `cfg` | FLOAT | yes | advanced CFG value for the native fallback when `negative` is used |
-| `lock_audio` | BOOLEAN | yes | preserve or refine pass-1 audio |
-
-\* `audio_latent` is required at runtime when `latent` contains only a plain 24-channel video stream. Leave it disconnected when `latent` already contains native joint `[video,audio]` samples.
-
-\** For native/non-Continuum use, connect `model + positive`. For Continuum, connect `refine_state`; a valid `refine_state` takes precedence if old manual fallback wires are still present.
-
-**Output:** one final decode-ready `LATENT`.
-
----
-
-## 🧪 Model / Architecture
-
-- **Latent format:** 24-channel MiniMax H3 video latent, normalized with the checkpoint's training channel statistics for learned inference.
-- **Default detected architecture:** `in_channels=24`, `in_blocks=12`, `out_blocks=12`, `base_channels=512`, `dropout=0.1`, `temporal_every=2`, `temporal_kernel=5`, `attn=False`.
-- **Interpolation:** 2D uses bilinear feature interpolation; 3D uses trilinear.
-- **Temporal handling:** learned variants preserve T and scale only H×W. The 3D path intentionally runs the complete temporal extent rather than silently splitting long sequences into independent chunks.
-- **H3 DiT grid:** H3 pads target video H/W to its 2×2 patch grid internally and crops back to the requested latent shape. The refinement node leaves the learned output shape unchanged and adjusts target keyframe conditioning instead of adding physical latent cells.
-
-### Upstream sync policy
-
-This fork tracks useful LBH upstream changes **selectively**, not by mechanically merging every upstream commit. A clean Git graph is not more important than preserving numerically sound behavior.
-
-The 2026-08-21 upstream changes were reviewed as follows:
-
-**Adopted, with redesign:**
-
-- **Dual-axis alignment fix.** The underlying upstream concern was valid: both output axes should satisfy the requested pixel alignment, not just one axis. This fork uses `lcm(align, 16)` so the user-requested grid and H3's 16× VAE grid are both satisfied.
-- **Model offload.** The useful low-VRAM behavior is available as `offload_after_upscale`, but it is opt-in and defaults to `False`. On the integrated node it happens between learned upscale and sampler 2, where freeing the learned model can be most useful.
-- **Cache rehoming.** If an optionally offloaded learned model is reused, the cached model is moved back to the requested device before inference.
-
-**Deliberately not adopted:**
-
-- **16-frame temporal chunking with only `temporal_kernel // 2` overlap.** This is not numerically equivalent to full-sequence execution. The 3D network contains repeated Conv3d/TemporalConv layers, and GroupNorm computes statistics across temporal/spatial dimensions. Splitting the sequence therefore changes normalization statistics and receptive context; merely overlapping two frames for a kernel-5 temporal convolution does not restore equivalence and can introduce chunk-boundary differences.
-- **Forced CPU offload after every run.** This needlessly adds CPU↔GPU transfer/reload latency for repeated runs and high-VRAM systems. Offload is explicit instead.
-- **Replacing private-copy in-place normalization/denormalization solely for claimed precision.** The arithmetic dtype is unchanged, so this does not improve numerical precision and would allocate additional full-latent intermediates.
-- **Removing `keep_proportion`.** Correct dual-axis alignment does not require deleting aspect-ratio lock; the fork keeps the option and solves the actual geometry problem.
-
-Because of these intentional choices, this fork may remain logically diverged from LBH upstream even after all useful upstream changes have been evaluated.
-
-### Validation scope
-
-Synthetic tests cover native/split AV validation, learned-upscaler delegation, exact target geometry, keyframe/reference behavior, denoise-mask reconstruction, Continuum refinement-state resolution and precedence over stale manual fallback wires, actual internal guider/sampler invocation, optional native-fallback CFG behavior, partial-denoise guards, exact locked-audio restoration, dual-axis/common-grid alignment, long-video non-chunked execution, cached-model device restore, and integrated pre-refinement offload targeting.
-
-GitHub Actions validates Python 3.10–3.13 and multiple reviewed ComfyUI source revisions using the native repository-root fixture, Ruff on the clean integration/test surfaces, `compileall`, native ComfyUI source-contract tests, and the full refinement regression suite. The integrated path has also been exercised successfully in a real MiniMax H3 CUDA workflow with the LBH learned checkpoint; exact quality and performance remain workload- and hardware-dependent.
-
----
-
-## 📊 Training Data
-
-The upscaler was trained on **~80,000 paired samples** (low-resolution latent + high-resolution target), weighted heavily toward video and 2× scaling.
-
-| Modality | Pairs | Share |
-| :--- | :--- | :--- |
-| Video clips | ~70,000 | ~87.5% |
-| 2K images | ~8,000 | ~10% |
-
-Approximate scale distribution:
-
-| Scale | Share |
-| :--- | :--- |
-| 2× | 40% |
-| 1.5× | 10% |
-| 2.5× | 10% |
-| 3× | 10% |
-| 4× | 10% |
-| arbitrary 1.0×–4.0× | 10% |
-
----
-
-## 🙏 Acknowledgments
-
-This node follows the neural-latent-upscaling approach pioneered by [ComfyUi_NNLatentUpscale](https://github.com/Ttl/ComfyUi_NNLatentUpscale) by **Ttl**. The model architecture also draws on the **LTX 2.3 Spatial Upscaler** (`ltx-2.3-spatial-upscaler-x2-1.1.safetensors`).
-
-The H3 refinement integration was independently implemented after studying [Tr1dae/ComfyUI-MiniMaxH3_LatentUpscaler](https://github.com/Tr1dae/ComfyUI-MiniMaxH3_LatentUpscaler) and current ComfyUI MiniMax H3 sampling code. This repository continues to use the LBH learned upscaler/checkpoints and does not depend on Tr1dae's or Mamad8's learned-upscaler packages.
+For INT8 fused MLP runtime adapters, retain that ComfyUI Patcher PR overlay until
+the repair is available upstream. The independent Core #16720 optimization is
+not included in this release set.
+
+## Acknowledgments
+
+- [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler): the original nodes, network and pre-trained checkpoints.
+- [Ttl/ComfyUi_NNLatentUpscale](https://github.com/Ttl/ComfyUi_NNLatentUpscale): the neural latent-upscaling approach.
+- LTX 2.3 Spatial Upscaler (`ltx-2.3-spatial-upscaler-x2-1.1.safetensors`): architectural reference for the network.
+- [Tr1dae/ComfyUI-MiniMaxH3_LatentUpscaler](https://github.com/Tr1dae/ComfyUI-MiniMaxH3_LatentUpscaler) and ComfyUI's MiniMax H3 sampling code were studied for the refinement integration, which was implemented independently. This package depends on neither Tr1dae's nor Mamad8's upscaler packages.

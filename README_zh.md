@@ -3,265 +3,319 @@
   <a href="./README_zh.md"><strong>中文</strong></a>
 </p>
 
-<div align="center">
+# ComfyUI MiniMax H3 Latent Upscaler-Plus
 
-# ComfyUI Minimax H3 Latent Upscaler-Plus
+用于 ComfyUI 的 MiniMax H3 视频 latent 学习式空间放大，并可选集成低 sigma 的 H3 精修采样。
 
-> **Plus 分支：** 这是 `xmarre` 维护的 [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) Plus 分支。它保留上游项目基础，同时维护可能有意与上游不同的功能、集成和修复。
+> **Plus 分支：** 这是 `xmarre` 维护的 [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) 分支。它使用相同的学习网络和权重，并增加了 H3 感知的精修、H3 Continuum 互通、采样器内部交接 provider 以及若干正确性修复。部分行为有意与上游不同，见[与上游的差异](#与上游的差异)。
 
-**MiniMax H3 视频生成的神经网络 Latent 放大器**  
-Learned · 高保真 · 2D / 3D
+训练好的网络直接放大 24 通道 H3 视频 latent。两阶段工作流因此可以先在较低分辨率生成，在 latent 空间放大，再在目标分辨率做简短精修，无需 VAE 解码 → 像素放大 → VAE 编码的往返。音频从不经过放大网络。
 
-</div>
+学习式放大节省的是时间。它不会降低后续 H3 采样所需的显存，后续采样仍在完整的目标分辨率网格上运行 transformer。
 
-## 📰 更新
+**示例：** [视频对比（MP4）](examples/Minimax_h3_latent_Upscaler_001.mp4)
 
-- [2026-08-20] 🧩 **集成式 MiniMax H3 精修**：H3 专用 3D 节点现在内部完成完整的 learned upscale + 低噪声 H3 第二次采样。H3 Continuum V3.4 通过精确的逐 chunk `refine_state` 提供 MODEL / CONDITIONING 状态；不再需要外接 BasicGuider、DisableNoise 或 SamplerCustomAdvanced。
-- [2026-08-19] 🚀 **3D 节点重构**：倍率、目标尺寸、megapixels 三种缩放模式合并到同一节点。
-- [2026-08-18] 🔥 **精度选择**：2D/3D 支持 fp32 / fp16 / bf16。
+![图像放大对比](examples/Minimax_h3_latent_Upscaler_002.jpg)
 
-本项目使用训练好的神经网络直接放大 **MiniMax H3 24 通道视频 latent**，避免简单 bilinear/bicubic latent 插值，也可避免昂贵的 VAE decode → 像素放大 → VAE encode 往返流程。
+## 目录
 
-> Learned upscale 能节省时间，但不会降低第二次 H3 精修在目标分辨率上的峰值显存需求。
+- [节点](#节点)
+- [安装](#安装)
+- [工作流](#工作流)
+- [行为说明](#行为说明)
+- [节点参考](#节点参考)
+- [Provider API](#provider-api)
+- [模型与训练数据](#模型与训练数据)
+- [与上游的差异](#与上游的差异)
+- [测试](#测试)
+- [H3 协同发布集](#h3-协同发布集)
+- [致谢](#致谢)
 
 ## 节点
 
-`video/MinimaxH3` 下包含：
+所有节点都位于 `video/MinimaxH3` 分类下。
 
-- **Minimax H3 Latent Upscaler (2D)** — 较轻量的 learned spatial upscale。
-- **Minimax H3 Latent Upscaler (3D)** — 完整 3D learned upscale，支持倍率、目标尺寸和 megapixels。
-- **MiniMax H3 Latent Upscaler + Refine (3D)** — 完整两阶段 H3 路径：learned video upscale、AV 重组、条件/掩码适配、目标网格新噪声，以及实际第二次 H3 sampling。
+| 显示名称 | 节点 ID | 用途 |
+| --- | --- | --- |
+| Minimax H3 Latent Upscaler (2D) | `MinimaxH3LatentUpscalerNode2D` | 2D 主干加时间层的学习式放大。仅支持倍率模式。 |
+| Minimax H3 Latent Upscaler (3D) | `MinimaxH3LatentUpscaler3D` | 完整 3D 学习式放大。支持倍率、目标尺寸或百万像素模式，并做双轴对齐。 |
+| MiniMax H3 Latent Upscaler + Refine (3D) | `MinimaxH3LatentUpscaler3DRefineHandoff` | 学习式 3D 放大后执行 H3 精修采样，输出可直接解码的 LATENT。支持原生联合 AV latent 和 H3 Continuum 分段列表。 |
+| MiniMax H3 Latent Upscaler Provider (3D) [Experimental] | `MinimaxH3LatentUpscaler3DProvider` | 采样器内部学习式交接的配置对象，例如 Flow-Aligned Regenerate 的 `learned_3d` 迁移。自身不采样。 |
 
-独立的 2D/3D 节点仍然只是普通 `LATENT → LATENT` 放大器。只有需要第二次 H3 精修时才使用集成 Refine 节点。
+2D 和 3D 节点是普通的 `LATENT → LATENT` 放大器，不运行 H3。
 
----
-
-## 📦 安装
+## 安装
 
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus.git Comfyui_Minimax_h3_latent_Upscaler
 ```
 
-模型放到：
+安装后重启 ComfyUI。标准 ComfyUI 之外唯一的依赖是 `einops`，ComfyUI 已自带。
+
+### 权重
+
+把权重放到 `ComfyUI/models/latent_upscale_models/`。该目录会自动注册，并以非递归方式扫描其中的 `.safetensors` 和 `.pth` 文件。
+
+预训练权重：[huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
+
+| 文件 | 存储精度 |
+| --- | --- |
+| `minimax_h3_latent_upscaler_3d_bf16.safetensors` | bf16 |
+| `minimax_h3_latent_upscaler_3d_fp16.safetensors` | fp16 |
+| `minimax_h3_latent_upscaler_3d_fp32.pth` | fp32 |
+
+这些文件是同一个 3D 结构，供 3D、Refine 和 Provider 节点使用。若存在 bf16 文件，Provider 会默认选中它。`precision` 控件设置的是推理精度，与文件的存储精度相互独立。
+
+加载器会从权重中检测块数、通道宽度和时间层。2D 节点需要 2D 主干结构的权重；在 2D 节点中加载 3D 权重会报缺少权重的错误。
+
+## 工作流
+
+### 单独放大
+
+2D 和 3D 节点接收纯 24 通道视频 latent（`B×24×T×H×W`，单帧为 `B×24×H×W`）。联合 H3 音视频 latent 需先拆分，放大后再合并：
 
 ```text
-ComfyUI/models/latent_upscale_models/
+联合 H3 AV latent
+  → LTXVSeparateAVLatent
+      video_latent → Minimax H3 Latent Upscaler (3D) ─┐
+      audio_latent ───────────────────────────────────┤
+  → LTXVConcatAVLatent
+  → 自选的第二次 H3 采样，或 VAE Decode
 ```
 
-预训练权重：
+[`workflow_templates/`](workflow_templates/) 中的图生视频和参考生视频工作流使用这一方式，之后用 `BasicGuider` 和 `SamplerCustomAdvanced` 在外部完成第二次采样。
 
-https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler
+### 在一个节点中放大并精修
 
-更新或安装后重启 ComfyUI。
-
----
-
-## 🧩 使用方法
-
-### 普通 latent upscale
+**MiniMax H3 Latent Upscaler + Refine (3D)** 取代了“拆分 / 放大 / 合并 / 第二个采样器”这一串节点：
 
 ```text
-MiniMax H3 latent
-→ Minimax H3 Latent Upscaler (2D / 3D)
-→ VAE Decode
+低分辨率 H3 latent ─► MiniMax H3 Latent Upscaler + Refine (3D) ─► VAE Decode
+                        + noise    (RandomNoise)
+                        + sampler  (KSamplerSelect)
+                        + sigmas   (部分去噪调度，sigmas[0] < 1)
+                        + model + positive   （原生工作流）
+                          或 refine_state    （H3 Continuum）
 ```
 
-这条路径不会再执行 H3 transformer。
+原生工作流连接联合 AV 的 `latent`、`model` 和 `positive`，`audio_latent` 保持断开。`negative` 可选：不连接时节点只用正向条件引导采样，这是 H3 的常规用法；连接后节点按 `cfg` 使用 CFG。
 
-### 原生 H3 两阶段精修
+不要再外接 `BasicGuider`、`DisableNoise` 或 `SamplerCustomAdvanced`，节点内部自己完成采样。
 
-```text
-低分辨率 clean joint H3 AV latent
-              │
-              ▼
-MiniMax H3 Latent Upscaler + Refine (3D)
-  + MODEL
-  + positive CONDITIONING
-  + RandomNoise
-  + KSamplerSelect
-  + partial-denoise SIGMAS
-              │
-              ▼
-       最终 H3 LATENT
-              │
-              ▼
-          VAE Decode
-```
+### H3 Continuum
 
-MiniMax H3 原生 fallback 路径通常只使用 positive conditioning。`negative` 保留为可选 CFG 兼容输入；未连接 negative 时节点内部使用 positive-only BasicGuider 语义。
-
-### H3 Continuum V3.4
-
-需要配套的 H3 Continuum `refine_state` 支持：
-
-https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/15
-
-正确连接：
+连接 [H3 Continuum-Plus](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus) 中 **H3 Continuum Sampler V3.4** 的并行分段列表输出：
 
 ```text
 H3 Continuum Sampler V3.4
-  video_latents -----> MiniMax H3 Latent Upscaler + Refine.latent
-  audio_latents -----> MiniMax H3 Latent Upscaler + Refine.audio_latent
-  refine_state ------> MiniMax H3 Latent Upscaler + Refine.refine_state
-
-RandomNoise ---------> MiniMax H3 Latent Upscaler + Refine.noise
-KSamplerSelect ------> MiniMax H3 Latent Upscaler + Refine.sampler
-partial SIGMAS ------> MiniMax H3 Latent Upscaler + Refine.sigmas
-
-MiniMax H3 Latent Upscaler + Refine.latent
-  -------------------> VAE Decode / 后续 assembly
+  video_latents ──► Refine.latent
+  audio_latents ──► Refine.audio_latent
+  refine_state  ──► Refine.refine_state
 ```
 
-**不要再添加外部 BasicGuider、DisableNoise 或 SamplerCustomAdvanced。** 第二次采样已经在 Refine 节点内部完成。
+连接 `refine_state` 后，Continuum 会为每个分段捕获一个新的 MODEL 克隆（带有该分段的 Continuum 选项）以及第一次采样实际使用的正向条件。Continuum 还会把每个分段的视频/音频去噪掩码附加到 latent 输出上。已连接的 `refine_state` 优先：残留的 `model`、`positive` 或 `negative` 连接会被忽略；`refine_state` 格式错误时直接报错，而不会退回使用这些连接。
 
-Continuum 的 `video_latents`、`audio_latents`、`refine_state` 都是逐 chunk 的并行 list output，ComfyUI 会按相同 index 映射。
+节点按顺序处理整个分段列表。如果某个分段以完全受保护的续接前缀开头（整段时间步的去噪掩码为 0），在第二次采样之前，该前缀会被替换为上一分段*精修后*输出的最后几个时间步。这样相邻分段衔接的是精修后的内容，而不是各自独立放大的副本。`lock_audio` 关闭时，音频前缀也按同样方式承接。承接要求各分段的视频几何尺寸一致。
 
-有效的 Continuum `refine_state` 是权威输入。如果升级后的旧 workflow 仍然保留 `model`、`positive` 或 `negative` fallback 连接，这些手工 conditioning 输入会被忽略，而不会再因为同时连接而报错，也不会把 Continuum 的 positive-only 第二次采样意外改成 CFG。无效或损坏的 `refine_state` 仍然会 fail closed，不会悄悄退回旧连接。
+Run Storage 不保存精修状态。连接 `refine_state` 时如果 Continuum 复用已存储的分段，会直接报错。请关闭 Run Storage，或从第 1 段重新生成。
 
-### `refine_state` 为什么必要
+### 采样器内部交接（实验性）
 
-Continuum 的第二次采样不能只靠 video/audio tensor 恢复。每个 chunk 的 `refine_state` 提供：
+**MiniMax H3 Latent Upscaler Provider (3D)** 输出一个 `H3_LATENT_UPSCALER` 对象。把它连接到接受该类型的消费者，例如 [MiniMax-H3 Flow-Aligned Regenerate](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate) 的 Target Input 渐进交接，并在消费者中选择学习式迁移模式（`learned_3d`）。消费者在每次交接时对其干净视频估计调用一次 provider，并指定精确的目标 latent 尺寸。Provider 从不接收音频，也不运行任何 H3 步。推荐的交接设置见消费者的文档。
 
-- 保留该 chunk Continuum model options/context hint 的 fresh MODEL clone，并重新安装 fresh Continuum APPLY_MODEL wrapper；
-- sampler 1 实际收到的精确 positive CONDITIONING。
+## 行为说明
 
-Native Masked continuation 如果使用了 joint AV `noise_mask`，Continuum 还会把精确 video/audio mask 放回对应的 split LATENT。Refine 节点只把 video mask resize 到新的高分辨率目标网格，audio mask 保持原语义。
+### 输出尺寸与对齐
 
-因此单独重新运行一个通用 `MiniMaxH3ImageToVideo` conditioning，或者把无关的 raw H3 MODEL 接到 sampler 2，都不能视为 Continuum sampler 1 的精确等价状态。
+3D 和 Refine 节点根据所选模式计算像素空间目标：
 
-### Run Storage
+- `scale by multiplier`：源尺寸 × `scale`。
+- `target dimensions`：`width` × `height`。
+- `megapixels`：按源宽高比取 `megapixels × 1024²` 个像素。
 
-运行期 MODEL / CONDITIONING 状态不会被持久化到 Continuum Run Storage。如果 `refine_state` 已连接，而本次运行复用了旧 chunk prefix，Continuum 会直接报错，而不是把新捕获的状态错误地和旧 latent 配对。
+`align` 是像素空间要求。H3 的 VAE 还需要 16 像素网格，因此两个轴都放在 `lcm(align, 16)` 网格上。默认 `align=32` 对应 32 像素网格；`align=24` 对应 48 像素网格。
 
-精确 refine 运行应使用：
+- `keep_proportion=False`：宽和高分别取整到网格。
+- `keep_proportion=True`：在附近的网格组合中搜索，选出最能保持源宽高比且接近目标的一组，两个轴都在网格上。
 
-- `Run Storage = Off`，或
-- 从 Chunk 1 重新生成，使所有输出 chunk 都在当前执行中采样。
+只支持放大。任一轴目标小于源尺寸都会被拒绝。结果与源尺寸相同时，原样返回 latent。
 
-### 第二次采样语义
+2D 节点按 `scale` 缩放 latent 网格并取整，不做像素网格对齐。
 
-集成节点直接遵循 ComfyUI 的正常 advanced-sampler 路径：
+### 精修采样
 
-1. learned upscaler 只放大 24-channel video latent；
-2. 重建 clean 高分辨率 joint H3 `[video,audio]`；
-3. 在新的 AV 网格上生成独立 fresh noise；
-4. Continuum 使用 positive-only H3 guider；只有显式 native fallback 路径在连接 `negative` 时才使用 CFG guider；
-5. 用输入的 `SAMPLER`、`SIGMAS`、clean latent、noise 和 denoise mask 调用采样；
-6. ComfyUI sampler 自己执行正常 `model_sampling.noise_scaling(...)`；
-7. 节点直接输出最终、可 decode 的 LATENT。
+Refine 节点依次：
 
-不再存在手工 pre-noise / inverse-noise handoff，也不需要 DisableNoise。
+1. 用学习式 3D 网络只放大视频分量；
+2. 可选地把学习模型移到 CPU（`offload_after_upscale`）；
+3. 在放大后的网格上重建联合 H3 AV latent；
+4. 在放大后的网格上重建去噪掩码（见[音频与掩码](#音频与掩码)）；
+5. 调整目标网格条件的尺寸（见[条件几何](#条件几何)）；
+6. 用 `noise` 为放大后的 AV 网格生成新噪声；
+7. 通过 ComfyUI 标准 guider 路径，用给定的 `sampler` 按 `sigmas` 采样。噪声缩放由 ComfyUI 按模型自身的方式完成，因此没有手动预加噪，也没有 `DisableNoise` 阶段。
 
-对于 H3 CONST 参数化，full-noise 起点会让 learned-upscaled clean latent 的权重变成 0，因此 Refine 节点要求：
+`sigmas[0]` 必须满足 `0 <= sigmas[0] < 1`。在 H3 的 flow 参数化下，从 1.0 开始的调度会让放大后的 latent 权重为零，因此会被拒绝；请使用部分去噪调度。`SIGMAS` 为空时，直接返回放大后的 latent，不采样。
 
-```text
-0 <= sigmas[0] < 1
-```
+第二次采样在 MODEL 的克隆上运行，该克隆的 `transformer_options["h3_refinement"]` 把这次调用标记为精修（API 1，`sigma_reference` 为模型的 `sigma_max`）。配套的运行时补丁会读取这一约定，因此把第二次采样当作精修而不是一次全新生成。原 MODEL 不会被修改。
 
-以 `1.0` 开始的 full-denoise schedule 会被拒绝。请使用 partial-denoise 第二次 schedule。
+第二次采样的开销随目标 token 数增长。空间放大 2× 时，每个 H3 步的视频 token 约为原来的 4 倍。请保持精修调度简短，并在自己的硬件上测试。
 
-第二次采样应保持短小；即使只有少量 steps，2× spatial refine 仍可能很昂贵，因为 latent H/W 同时翻倍会让每个 H3 transformer step 的 video token 数量约变成 4 倍。实际速度应在目标硬件和工作流上测量，不要把 learned upscaler 本身当作主要耗时来源。
+### 音频与掩码
 
-### Audio
+`lock_audio`（默认开启）：
 
-`lock_audio=True`：
+- **开启**：音频噪声为零，音频去噪掩码为零，采样后精确恢复第一次采样的音频。
+- **关闭**：音频获得正常噪声并与视频一起精修，保留已有的音频去噪掩码。
 
-- audio 不进入 learned spatial upscaler；
-- audio refinement noise = 0；
-- audio denoise mask = 0；
-- sampler 2 后恢复 sampler 1 的 clean audio，不把它强制转换为 learned video 的精度。
+已有的视频去噪掩码会用最近邻方式缩放到放大后的网格，因此完全受保护的区域保持受保护，Native-Masked 续接前缀不会被重新去噪。没有掩码且 `lock_audio` 关闭时，节点不带掩码采样。
 
-`lock_audio=False`：
+### 条件几何
 
-- 生成正常 H3 audio noise；
-- 保留已有 audio denoise mask；
-- sampler 2 可以 refine/remix audio。
+- `minimax_keyframes` 是目标网格条件，会被调整到 H3 内部填充后的偶数 latent 网格（H3 会把 H/W 填充到其 2×2 patch 网格）。
+- `minimax_refs` 是独立的参考块，有自己的 latent 尺寸和 RoPE 网格，保持不变。
+- 条件会被复制，不会被原地修改；容器类型和附加字段保持不变。
 
-### Conditioning geometry
+放大后的 latent 本身保持学习输出的精确形状，H3 在内部会把填充部分裁回。
 
-- `minimax_keyframes` 属于目标视频网格，放大后会更新到 H3 内部 padded-even 目标 H/W；
-- `minimax_refs` 是独立 reference block，拥有自己的 latent H/W 和 RoPE grid，故保持不变；
-- metadata 通过 clone 更新，不原地修改调用方数据；
-- conditioning entry 的 list/tuple 类型和额外字段保持不变。
+### 模型缓存、设备与卸载
 
----
+- 加载后的网络按 `(权重, 设备, 精度)` 缓存，并在多次运行之间复用。
+- `offload_after_upscale`（3D、Refine 和 Provider；默认关闭）在使用后把缓存的网络移到 CPU，下次使用时再移回。在 Refine 节点上，卸载发生在放大之后、第二次采样之前，此处回收显存最有意义。显存足够时请保持关闭，否则每次运行都要付出传输开销。
+- 没有 CUDA 时，2D、3D 和 Refine 节点会退回 CPU。Provider 不会静默切换设备，而是直接报错。
+- 3D 网络始终一次处理完整的时间序列，从不切分为时间分块。
+- 推理时禁用学习网络中的注意力层。
 
-## Refine 节点接口
+## 节点参考
 
-| 参数 | 类型 | 必需？ | 说明 |
-| :--- | :--- | :---: | :--- |
-| `latent` | LATENT | 是 | native joint H3 或 split video latent |
-| `noise` | NOISE | 是 | 新目标网格 fresh noise |
-| `sampler` | SAMPLER | 是 | 节点内部实际执行的 sampler |
-| `sigmas` | SIGMAS | 是 | partial-denoise 第二次 schedule |
-| `audio_latent` | LATENT | 否* | split H3/Continuum 的对应 audio latent |
-| `refine_state` | H3_CONTINUUM_REFINE_STATE | 否** | Continuum 推荐且权威的 MODEL + CONDITIONING 路径 |
-| `model` | MODEL | 否** | 非 Continuum / native fallback；连接 `refine_state` 时忽略 |
-| `positive` | CONDITIONING | 否** | 非 Continuum / native positive fallback；连接 `refine_state` 时忽略 |
-| `negative` | CONDITIONING | 否 | native fallback 的可选 CFG 输入；连接 `refine_state` 时忽略 |
-| `cfg` | FLOAT | 是 | 仅 native fallback 且连接 negative 时有意义 |
-| `lock_audio` | BOOLEAN | 是 | 锁定或精修 sampler-1 audio |
+### Minimax H3 Latent Upscaler (2D)
 
-\* 主 `latent` 是 plain 24-channel video 时，`audio_latent` 在运行时必须连接；native joint AV 输入则不要连接。
+| 输入 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `latent` | LATENT | | 24 通道视频 latent |
+| `model_name` | 下拉 | | 2D 主干权重 |
+| `scale` | FLOAT | 2.0 | 1.0–4.0 |
+| `device` | 下拉 | `cuda` | `cuda`、`cpu` |
+| `precision` | 下拉 | `fp32` | `fp32`、`fp16`、`bf16` |
 
-\** 非 Continuum 路径连接显式 `model + positive`；Continuum 路径连接 `refine_state`。如果旧 workflow 仍保留手工 fallback 连接，有效的 `refine_state` 会优先并忽略它们。
+输出：`LATENT`。
 
-**输出：一个最终可直接 VAE Decode 的 `LATENT`。**
+### Minimax H3 Latent Upscaler (3D)
 
----
+| 输入 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `latent` | LATENT | | 24 通道视频 latent，5D 或 4D |
+| `model_name` | 下拉 | | 3D 权重 |
+| `mode` | 下拉 | `scale by multiplier` | 显示 `scale`（1.0–4.0）、`width`/`height`（64–4096）或 `megapixels`（0.1–8.0） |
+| `align` | INT | 32 | 像素对齐，按 `lcm(align, 16)` 组合 |
+| `keep_proportion` | BOOLEAN | true | |
+| `device` | 下拉 | `cuda` | `cuda`、`cpu` |
+| `precision` | 下拉 | `fp16` | `fp32`、`fp16`、`bf16` |
+| `offload_after_upscale` | BOOLEAN | false | |
 
-## 🚀 Learned upscaler 特性
+尺寸输入的默认值：`scale` 2.0，`width` 1280，`height` 704，`megapixels` 1.0。输出：`LATENT`。
 
-- 24-channel MiniMax H3 latent。
-- 2D / 3D 两种网络。
-- 3D 支持倍率、目标尺寸、megapixels。
-- 自动检测 checkpoint 架构。
-- safetensors 直接加载到目标 device/precision。
-- meta-device 构建 + `load_state_dict(assign=True)`，减少 CPU 峰值。
-- 按 `(name, device, precision)` 缓存 learned model。
-- 支持 CUDA / CPU、fp32 / fp16 / bf16。
-- 推理时强制关闭 learned-upscaler attention (`attn=False`) 以提高速度与稳定性。
+### MiniMax H3 Latent Upscaler + Refine (3D)
 
-H3 本身会把目标 video latent H/W pad 到 2×2 DiT patch grid 后再 crop 回请求尺寸。Refine 节点不会物理增加 latent cell，而只更新需要匹配目标网格的 keyframe conditioning。
+包含 3D 节点的 `model_name`、`mode`、`scale`、`width`、`height`、`megapixels`、`align`、`keep_proportion`、`device`、`precision`（默认 `fp16`）和 `offload_after_upscale`。所有尺寸输入都会显示，但只有所选 `mode` 用到的才生效。其他输入：
 
----
+| 输入 | 类型 | 必需 | 说明 |
+| --- | --- | --- | --- |
+| `latent` | LATENT | 是 | 原生联合 AV latent，或拆分输入时的视频 latent |
+| `noise` | NOISE | 是 | 例如 `RandomNoise` |
+| `sampler` | SAMPLER | 是 | 例如 `KSamplerSelect` |
+| `sigmas` | SIGMAS | 是 | 部分去噪调度，`sigmas[0] < 1` |
+| `lock_audio` | BOOLEAN | 是 | 默认 true |
+| `cfg` | FLOAT | 是 | 默认 1.0；仅在原生路径连接了 `negative` 时使用 |
+| `audio_latent` | LATENT | 仅拆分输入 | `latent` 只含视频时必需；联合 AV latent 时必须断开 |
+| `refine_state` | H3_CONTINUUM_REFINE_STATE | Continuum | 优先于 `model`/`positive`/`negative` |
+| `model` | MODEL | 原生 | 无 `refine_state` 时必需 |
+| `positive` | CONDITIONING | 原生 | 无 `refine_state` 时必需 |
+| `negative` | CONDITIONING | 否 | 仅原生路径；启用 CFG |
 
-## 🧪 验证
+输出：`LATENT` 列表，为最终可直接解码的结果。单个 latent 输入得到只含一项的列表。
 
-CPU/mock regression tests 覆盖：
+### MiniMax H3 Latent Upscaler Provider (3D) [Experimental]
 
-- native/split AV validation；
-- learned 3D delegation；
-- target geometry；
-- keyframe/reference semantics；
-- mask reconstruction；
-- Continuum exact refine-state 与其对旧手工 fallback 连接的优先级；
-- 无效 refine-state 的 fail-closed 行为；
-- 内部 guider/sampler 实际调用；
-- native fallback optional negative CFG；
-- partial-denoise guard；
-- `lock_audio=True` 的精确 audio 恢复。
+| 输入 | 类型 | 默认值 |
+| --- | --- | --- |
+| `model_name` | 下拉 | 存在时为 `minimax_h3_latent_upscaler_3d_bf16.safetensors` |
+| `device` | 下拉 | `cuda` |
+| `precision` | 下拉 | `bf16` |
+| `offload_after_upscale` | BOOLEAN | false |
 
-分支包含 Python 3.10–3.13 GitHub Actions matrix。集成路径也已在真实 MiniMax H3 + LBH learned checkpoint 的 CUDA 工作流中成功执行；具体画质与耗时仍取决于工作流和硬件。
+输出：`H3_LATENT_UPSCALER`。
 
----
+## Provider API
 
-## 📊 训练数据
+`H3_LATENT_UPSCALER` 的值是一个不可变的 `H3LatentUpscalerProvider`（`nodes/minimax_h3_handoff_provider.py`）。它只保存配置；权重加载和模型缓存留在本包内部。
 
-Learned upscaler 使用约 **80,000 组 paired samples** 训练，其中视频占主要部分，2× 是最常见倍率。
+| 属性 | 值 |
+| --- | --- |
+| `kind` | `"minimax_h3_learned_latent_upscaler"` |
+| `api_version` | `1` |
+| `h3_patch_lattice_api` | `2` |
+| `model_name`、`device`、`precision`、`offload_after_upscale` | 节点输入 |
 
-| 数据类型 | 数量 | 占比 |
-| :--- | :--- | :--- |
+- `upscale_clean_video(video, *, target_h, target_w)`：接收干净的浮点 `B×24×T×H×W` 视频 latent，精确输出 `target_h × target_w`，保持 batch、通道、时间和 dtype。任一轴缩小会被拒绝；结果含非有限值时报错。
+- `upscale_clean_video_h3_patch_lattice(video, *, target_h, target_w)`：运行同一网络，但在解码器之前，把稠密编码器特征重采样到这样一组坐标上：相邻单元坐标的均值等于 H3 原生 patch 中心（`h3_dense_patch_center_lattice_v2`）。要求空间轴为偶数，供需要在交接处匹配 H3 patch 坐标映射的消费者使用。普通节点和 provider 路径保持训练时的半像素插值。背景说明：[`docs/TRANSFER_LATTICE_20261004.md`](docs/TRANSFER_LATTICE_20261004.md)。
+
+## 模型与训练数据
+
+- **输入：** 24 通道 H3 视频 latent；推理前用训练时的逐通道统计量归一化，推理后反归一化。
+- **3D 结构（默认配置；加载器从权重读取实际值）：** `in_channels=24`，编码器和解码器各 12 个 512 通道残差块，每隔一个残差块后接一个时间卷积（kernel 5），以及学习的倍率嵌入。
+- **重采样：** 3D 网络在编码器和解码器之间做三线性插值，2D 网络做双线性插值。时间轴保持不变，只缩放 H×W。
+
+上游权重在约 80,000 对样本（低分辨率 latent 与高分辨率目标）上训练：
+
+| 类型 | 对数 | 占比 |
+| --- | --- | --- |
 | 视频片段 | ~70,000 | ~87.5% |
-| 2K 图片 | ~8,000 | ~10% |
+| 2K 图像 | ~8,000 | ~10% |
 
-大致倍率分布：2× 约 40%；1.5× / 2.5× / 3× / 4× 各约 10%；另有约 10% 的 1.0×–4.0× 任意小数倍率用于提高连续倍率泛化。
+| 倍率 | 占比 |
+| --- | --- |
+| 2× | 40% |
+| 1.5×、2.5×、3×、4× | 各 10% |
+| 任意 1.0×–4.0× | 10% |
 
----
+## 与上游的差异
 
-## 🙏 致谢
+上游的改动会经过审查后选择性采纳。目前有意保留的差异：
 
-本项目延续 **Ttl** 的 [ComfyUi_NNLatentUpscale](https://github.com/Ttl/ComfyUi_NNLatentUpscale) 神经 latent upscale 思路，模型架构也参考了 **LTX 2.3 Spatial Upscaler**。
+- **不做时间分块。** 3D 网络对完整序列只运行一次。其堆叠的 3D/时间卷积和 GroupNorm 统计量跨越时间维度，带部分重叠的分块执行与完整序列执行并不等价，还可能在分块边界产生差异。
+- **卸载需手动开启。** `offload_after_upscale` 默认关闭，而不是每次运行后都卸载，以免重复运行或大显存环境反复传输。
+- **双轴对齐保留 `keep_proportion`。** 两个轴都对齐到 `lcm(align, 16)`，同时保留宽高比锁定。
+- **归一化在私有副本上原地进行。** 相同 dtype 下改为非原地运算只会增加整幅临时张量，不会提高数值精度。
+- **H3 专属新增**（上游没有）：Refine 节点、Continuum 互通和交接 Provider。
 
-H3 refine integration 在研究 [Tr1dae/ComfyUI-MiniMaxH3_LatentUpscaler](https://github.com/Tr1dae/ComfyUI-MiniMaxH3_LatentUpscaler) 与当前 ComfyUI MiniMax H3 sampling 代码后独立实现。本仓库仍使用 LBH 的 learned upscaler/checkpoint，不依赖 Tr1dae 或 Mamad8 的 learned-upscaler package。
+## 测试
+
+GitHub Actions 在推送到 `main` 和每个 pull request 时运行：在多个固定的 ComfyUI 源码版本上使用 Python 3.12，并在其中一个版本上使用 Python 3.10、3.11 和 3.13。每个任务运行 Ruff 和 `compileall`、原生 ComfyUI 源码契约测试以及回归测试套件。
+
+测试覆盖：原生与拆分 AV 校验、学习式放大的委托调用、精确输出几何与对齐、关键帧与参考条件、去噪掩码重建、Continuum `refine_state` 解析与优先级、顺序分段前缀承接、guider 与采样器调用、部分去噪保护、锁定音频恢复、完整序列执行、缓存设备恢复、卸载时机、provider 契约以及 H3 patch 坐标变换。
+
+测试不加载训练好的权重。输出质量、速度和峰值显存取决于工作负载和硬件，需要在真实工作流中检验。
+
+## H3 协同发布集
+
+本包与其他 H3 组件一起发布。各版本详情见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
+
+| 组件 | 版本 | 包含的 PR |
+| --- | --- | --- |
+| Flow-Aligned Regenerate | [v0.3.10](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.10) | [#96](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/96) |
+| Sol-H3 | [v0.1.9](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.9) | [#39](https://github.com/xmarre/ComfyUI-Sol-H3/pull/39) |
+| VDN-H3-Plus | [v1.5.8](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.8) | [#38](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/38) |
+| H3 Continuum-Plus | [v3.4.6](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.6) | [#39](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/39), [#40](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/40) |
+| Latent Upscaler-Plus | [v0.2.2](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/releases/tag/v0.2.2) | 未变更 |
+
+[Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28) 是未变更的配套组件。独立的 Keyless、音频训练以及已否决的解码几何实验不在本发布集中。
+
+经过测试的 Core 适配器修复是 [ComfyUI #16783](https://github.com/Comfy-Org/ComfyUI/pull/16783)。使用 INT8 融合 MLP 运行时适配器时，请保留该 ComfyUI Patcher PR overlay，直到上游包含此修复。独立的 Core #16720 优化不在本发布集中。
+
+## 致谢
+
+- [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)：原始节点、网络和预训练权重。
+- [Ttl/ComfyUi_NNLatentUpscale](https://github.com/Ttl/ComfyUi_NNLatentUpscale)：神经网络 latent 放大的思路。
+- LTX 2.3 Spatial Upscaler（`ltx-2.3-spatial-upscaler-x2-1.1.safetensors`）：网络结构参考。
+- 精修集成参考了 [Tr1dae/ComfyUI-MiniMaxH3_LatentUpscaler](https://github.com/Tr1dae/ComfyUI-MiniMaxH3_LatentUpscaler) 和 ComfyUI 的 MiniMax H3 采样代码，但为独立实现。本包不依赖 Tr1dae 或 Mamad8 的放大包。
