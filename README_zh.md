@@ -122,7 +122,7 @@ Run Storage 不保存精修状态。连接 `refine_state` 时如果 Continuum �
 
 ### 采样器内部交接（实验性）
 
-**MiniMax H3 Latent Upscaler Provider (3D)** 输出一个 `H3_LATENT_UPSCALER` 对象。把它连接到接受该类型的消费者，例如 [MiniMax-H3 Flow-Aligned Regenerate](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate) 的 Target Input 渐进交接，并在消费者中选择学习式迁移模式（`learned_3d`）。消费者在每次交接时对其干净视频估计调用一次 provider，并指定精确的目标 latent 尺寸。Provider 从不接收音频，也不运行任何 H3 步。推荐的交接设置见消费者的文档。
+**MiniMax H3 Latent Upscaler Provider (3D)** 输出一个 `H3_LATENT_UPSCALER` 对象。把它连接到接受该类型的消费者，例如 [MiniMax-H3 Flow-Aligned Regenerate](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate) 的 Target Input 渐进交接，并在消费者中选择学习式迁移模式（`learned_3d`）。消费者在每次交接时对其干净视频估计调用一次 provider，并指定精确的目标 latent 尺寸。Provider 从不接收音频，也不运行任何 H3 步。推荐的交接设置见消费者的文档。Flow-Aligned Regenerate 的 Partitioned Exact-Prefix Handoff 在每个 Continuum 续接块中也会调用它：其默认的 `progressive_uniform_source` 模式（Flow v0.3.11 起）在每个续接块通过 provider 迁移整个生成轨迹一次，因此请保持 provider 连接。
 
 ## 行为说明
 
@@ -303,10 +303,10 @@ GitHub Actions 在推送到 `main` 和每个 pull request 时运行：在多个�
 
 | 组件 | 版本 | 包含的 PR |
 | --- | --- | --- |
-| Flow-Aligned Regenerate | [v0.3.10](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.10) | [#96](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/96) |
-| Sol-H3 | [v0.1.9](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.9) | [#39](https://github.com/xmarre/ComfyUI-Sol-H3/pull/39) |
-| VDN-H3-Plus | [v1.5.8](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.8) | [#38](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/38) |
-| H3 Continuum-Plus | [v3.4.6](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.6) | [#39](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/39), [#40](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/40) |
+| Flow-Aligned Regenerate | [v0.3.11](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.11) | [#97](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/97) |
+| Sol-H3 | [v0.1.10](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.10) | [#40](https://github.com/xmarre/ComfyUI-Sol-H3/pull/40) |
+| VDN-H3-Plus | [v1.5.9](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.9) | [#39](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/39), [#40](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/40) |
+| H3 Continuum-Plus | [v3.4.6](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.6) | 未变更 |
 | Latent Upscaler-Plus | [v0.2.2](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/releases/tag/v0.2.2) | 未变更 |
 
 [Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28) 是未变更的配套组件。独立的 Keyless、音频训练以及已否决的解码几何实验不在本发布集中。
