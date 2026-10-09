@@ -118,6 +118,10 @@ def install_fake_comfy(monkeypatch):
     comfy.utils.PROGRESS_BAR_ENABLED = False
     latent_preview = types.ModuleType("latent_preview")
     latent_preview.prepare_callback = lambda *_args, **_kwargs: None
+    # Hide real comfy.* submodules another test may have imported; otherwise
+    # `import comfy.x` resolves against this fake parent and fails.
+    for name in [name for name in sys.modules if name.startswith("comfy.")]:
+        monkeypatch.delitem(sys.modules, name)
     monkeypatch.setitem(sys.modules, "comfy", comfy)
     monkeypatch.setitem(sys.modules, "comfy.samplers", comfy.samplers)
     monkeypatch.setitem(sys.modules, "comfy.sample", comfy.sample)

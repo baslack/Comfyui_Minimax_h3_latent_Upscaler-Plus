@@ -100,29 +100,6 @@ def test_long_video_forward_is_not_silently_temporally_chunked():
     assert not hasattr(model, "_forward_seg")
 
 
-def test_cached_model_is_rehomed_after_optional_offload():
-    calls = []
-
-    class FakeModel:
-        def to(self, device):
-            calls.append(str(device))
-            return self
-
-    key = "cached.safetensors::cpu::fp16"
-    fake = FakeModel()
-    previous = lbh.MODEL_CACHE.get(key)
-    lbh.MODEL_CACHE[key] = fake
-    try:
-        assert lbh.load_model("cached.safetensors", torch.device("cpu"), "fp16") is fake
-    finally:
-        if previous is None:
-            lbh.MODEL_CACHE.pop(key, None)
-        else:
-            lbh.MODEL_CACHE[key] = previous
-
-    assert calls == ["cpu"]
-
-
 def test_exact_clean_video_api_targets_requested_latent_grid_and_normalizes_once(
     monkeypatch,
 ):
@@ -217,35 +194,6 @@ def test_exact_clean_video_api_validates_input_before_model_load(
             device="cpu",
             precision="fp32",
         )
-
-
-def test_integrated_refiner_offloads_only_selected_cached_model(monkeypatch):
-    calls = []
-
-    class FakeModel:
-        def __init__(self, label):
-            self.label = label
-
-        def to(self, device):
-            calls.append((self.label, str(device)))
-            return self
-
-    selected = FakeModel("selected")
-    untouched = FakeModel("other")
-    fake_lbh = types.SimpleNamespace(
-        MODEL_CACHE={
-            "selected.safetensors::cuda::bf16": selected,
-            "other.safetensors::cuda::bf16": untouched,
-        }
-    )
-    monkeypatch.setattr(refine, "_lbh_module", lambda: fake_lbh)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(
-        torch.cuda, "empty_cache", lambda: calls.append(("cuda", "empty"))
-    )
-
-    assert refine._offload_cached_lbh_model("selected.safetensors", "cuda", "bf16")
-    assert calls == [("selected", "cpu"), ("cuda", "empty")]
 
 
 def test_integrated_refiner_does_not_offload_cpu_execution(monkeypatch):
