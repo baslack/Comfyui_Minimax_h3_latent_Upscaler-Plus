@@ -7,9 +7,13 @@ environment. `pytest` is the only extra package.
 cd <this repo>
 $env:COMFYUI_PATH = "<ComfyUI checkout>"          # e.g. D:\ComfyUI
 $env:PYTHONPATH   = "$env:COMFYUI_PATH;$PWD"
+$env:CUDA_VISIBLE_DEVICES = "-1"                  # hide the GPU (not "": that deletes the variable)
 <ComfyUI python> -m pytest tests -m "not gpu"     # fast, CPU only
-<ComfyUI python> -m pytest tests                  # also runs gpu tests
 ```
+
+To also run the `gpu` tests, `Remove-Item Env:CUDA_VISIBLE_DEVICES` and run
+`<ComfyUI python> -m pytest tests`, and only while ComfyUI isn't generating.
+Even CPU-only runs create a CUDA context unless the GPU is hidden.
 
 Run from the repo root as shown: `test_native_comfyui_fixture.py` expects
 `import nodes` to resolve to this package.
