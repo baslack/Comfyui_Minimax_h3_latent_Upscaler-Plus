@@ -41,6 +41,17 @@ from .minimax_h3_refine import (
 NODE_CLASS_MAPPINGS.update(NODE_CLASS_MAPPINGS_REFINE)
 NODE_DISPLAY_NAME_MAPPINGS.update(NODE_DISPLAY_NAME_MAPPINGS_REFINE)
 
+# Standalone conditioning-geometry step for graphs that split the AV latent
+# (minimax_h3_av_latent_split.py) and drive their own second-pass sampler
+# instead of the integrated refine node -- keeps minimax_keyframes in sync
+# with an upscaled video latent; a no-op on REF2VA's minimax_refs.
+from .minimax_h3_resize_target_conditioning import (
+    NODE_CLASS_MAPPINGS as NODE_CLASS_MAPPINGS_RESIZE_COND,
+    NODE_DISPLAY_NAME_MAPPINGS as NODE_DISPLAY_NAME_MAPPINGS_RESIZE_COND,
+)
+NODE_CLASS_MAPPINGS.update(NODE_CLASS_MAPPINGS_RESIZE_COND)
+NODE_DISPLAY_NAME_MAPPINGS.update(NODE_DISPLAY_NAME_MAPPINGS_RESIZE_COND)
+
 # Continuum list outputs must be consumed as one ordered sequence so sampler 2
 # can carry the actual post-refine tail of chunk N into chunk N+1's protected
 # Native-Masked prefix.  Register this wrapper last under the same stable node
