@@ -345,7 +345,7 @@ def _load_raw_sd(path, device, dtype):
                 sd[out_key] = _convert_state_tensor(f.get_tensor(k), dtype)
         return sd
 
-    sd = torch.load(path, map_location=device, weights_only=False)
+    sd = torch.load(path, map_location=device, weights_only=True)
     if isinstance(sd, dict) and 'model' in sd:
         sd = sd['model']
     sd = _extract_upscaler_sd(sd)
