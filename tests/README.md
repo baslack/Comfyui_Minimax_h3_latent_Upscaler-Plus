@@ -15,8 +15,9 @@ To also run the `gpu` tests, `Remove-Item Env:CUDA_VISIBLE_DEVICES` and run
 `<ComfyUI python> -m pytest tests`, and only while ComfyUI isn't generating.
 Even CPU-only runs create a CUDA context unless the GPU is hidden.
 
-Run from the repo root as shown: `test_native_comfyui_fixture.py` expects
-`import nodes` to resolve to this package.
+Run from the repo root and pass `tests` as shown: `tests/pytest.ini` then
+becomes the config (not ComfyUI's), and `test_native_comfyui_fixture.py`
+expects `import nodes` to resolve to this package.
 
 - `test_contract_*.py` test the contract (node schemas and saved-workflow
   widget layout, provider and upscale outputs), not internals. CPU tests use a
