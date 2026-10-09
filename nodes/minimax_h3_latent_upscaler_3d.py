@@ -14,6 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import folder_paths
+import comfy.model_management as mm
+import comfy.model_patcher
 import re
 from einops import rearrange
 from enum import Enum
@@ -394,20 +396,18 @@ def _detect_arch(sd):
     cfg["attn"] = False  # force off at inference for speed/stability
     return cfg
 
-def load_model(name, device, precision):
+def _patcher(name, device, precision):
     cache_key = f"{name}::{device}::{precision}"
     if cache_key in MODEL_CACHE:
-        # A cached CUDA model may have been explicitly offloaded after the prior
-        # execution. Moving an already-correct model is a no-op in PyTorch.
-        return MODEL_CACHE[cache_key].to(device)
+        return MODEL_CACHE[cache_key]
 
     path = folder_paths.get_full_path_or_raise(_LATENT_UPSCALE_FOLDER, name)
 
     dtype = _PRECISION_DTYPES.get(precision, torch.float32)
-    up_sd = _load_raw_sd(path, device, dtype)
+    up_sd = _load_raw_sd(path, "cpu", dtype)
     cfg = _detect_arch(up_sd)
 
-    # Meta construction avoids a second full FP32 CPU model before CUDA inference.
+    # Meta construction avoids a second full FP32 CPU model.
     with torch.device("meta"):
         model = LatentResizer3D(
             in_channels=cfg["in_channels"], in_blocks=cfg["in_blocks"], out_blocks=cfg["out_blocks"],
@@ -418,13 +418,81 @@ def load_model(name, device, precision):
     model.eval().requires_grad_(False)
     del up_sd
 
-    MODEL_CACHE[cache_key] = model
+    # ComfyUI owns placement: it can evict other models to fit this one and evict
+    # this one when something else needs the VRAM.
+    load_device = torch.device("cpu") if device.type == "cpu" else mm.get_torch_device()
+    patcher = comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=torch.device("cpu"))
+    MODEL_CACHE[cache_key] = patcher
     print(f"[MinimaxH3-3D] Loaded upscale model: {name}")
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,} | "
           f"Attn: forced off | Temporal: {'on' if cfg['temporal_every'] > 0 else 'off'} "
           f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']}) | "
           f"Precision: {precision} | Device: {device}")
-    return model
+    return patcher
+
+
+def load_model(name, device, precision):
+    """Return the checkpoint's module; ComfyUI's model management decides where its weights live."""
+    return _patcher(name, device, precision).model
+
+
+def _load_to_device(name, device, precision, memory_required):
+    if device.type == "cpu":
+        return
+    # Plain torch Conv3d cannot run partially loaded, so load it whole; memory_required
+    # lets ComfyUI evict other models to leave room for the activations too.
+    mm.load_models_gpu([_patcher(name, device, precision)], memory_required=memory_required, force_full_load=True)
+
+
+def unload_model(name, device, precision):
+    """Release this checkpoint's VRAM through ComfyUI; the CPU copy stays cached. Returns True if it was cached."""
+    patcher = MODEL_CACHE.get(f"{name}::{device}::{precision}")
+    if patcher is None:
+        return False
+    mm.unload_model_and_clones(patcher)
+    return True
+
+
+def _upscale_memory_required(video, target_h, target_w, dtype):
+    """Rough working memory of a full-clip pass of the 512-channel model (activations, not weights)."""
+    b, _, t, h, w = video.shape
+    element = torch.finfo(dtype).bits // 8
+    spatial = h * w + target_h * target_w
+    return 6 * b * 512 * t * spatial * element + 3 * b * 24 * t * spatial * element
+
+
+def _forward_temporal_chunked(model, x, target_size, chunk=32, **kwargs):
+    """Out-of-memory fallback: run overlapping time chunks and blend them.
+
+    GroupNorm statistics become per-chunk, so the result only approximates the
+    full-clip pass.
+    """
+    t = int(x.shape[2])
+    chunk = max(1, min(chunk, t // 2))
+    overlap = next((int(b.dwconv.weight.shape[2]) for b in model.in_blocks if isinstance(b, TemporalConv)), 0)
+    padded = F.pad(x, (0, 0, 0, 0, overlap, overlap), mode="replicate")
+    out = torch.zeros(x.shape[0], x.shape[1], t, target_size[1], target_size[2], device=x.device, dtype=x.dtype)
+    weights = torch.zeros(1, 1, t, 1, 1, device=x.device, dtype=x.dtype)
+    for seg_start in range(0, t, chunk):
+        seg_end = min(t, seg_start + chunk)
+        # Blended output frames, read with `overlap` frames of context on each side.
+        out_start = max(0, seg_start - overlap)
+        out_end = min(t, seg_end + overlap)
+        lo, hi = out_start, out_end + 2 * overlap  # padded coordinates
+        seg_out = model(padded[:, :, lo:hi], target_size=(hi - lo, target_size[1], target_size[2]), **kwargs)
+        s0 = overlap
+        n = out_end - out_start
+        weight = torch.ones(n, device=x.device, dtype=x.dtype)
+        if seg_start > out_start:
+            blend = seg_start - out_start
+            weight[:blend] = torch.arange(1, blend + 1, device=x.device, dtype=x.dtype) / (blend + 1)
+        if out_end > seg_end:
+            blend = out_end - seg_end
+            weight[-blend:] = torch.arange(blend, 0, -1, device=x.device, dtype=x.dtype) / (blend + 1)
+        out[:, :, out_start:out_end] += seg_out[:, :, s0:s0 + n] * weight.view(1, 1, n, 1, 1)
+        weights[:, :, out_start:out_end] += weight.view(1, 1, n, 1, 1)
+        del seg_out
+    return out / weights.clamp(min=1e-8)
 
 
 def upscale_clean_video_exact(
@@ -497,15 +565,32 @@ def upscale_clean_video_exact(
     if not math.isfinite(effective_scale) or effective_scale <= 0.0:
         raise ValueError("learned-upscaler scale embedding must be finite and positive")
 
-    work = video.to(device=requested_device, dtype=compute_dtype, copy=True)
+    _load_to_device(
+        model_name, requested_device, precision,
+        _upscale_memory_required(video, target_h, target_w, compute_dtype),
+    )
     model = load_model(model_name, requested_device, precision)
+    work = video.to(device=requested_device, dtype=compute_dtype, copy=True)
     norm_mean, norm_std = _make_norm_tensors(requested_device, compute_dtype)
+    oom = False
     with torch.inference_mode():
         work.sub_(norm_mean).div_(norm_std)
-        model_kwargs = {"scale": effective_scale, "target_size": (temporal, target_h, target_w)}
+        model_kwargs = {"scale": effective_scale}
         if spatial_lattice == H3_PATCH_LATTICE:
             model_kwargs["spatial_lattice"] = spatial_lattice
-        output = model(work, **model_kwargs)
+        try:
+            output = model(work, target_size=(temporal, target_h, target_w), **model_kwargs)
+        except Exception as e:
+            mm.raise_non_oom(e)
+            oom = True
+        if oom:
+            # Retried outside the except block so the failed attempt's tensors can be freed.
+            logging.warning(
+                "MiniMax H3 learned upscaler ran out of memory on the full clip; "
+                "retrying in temporal chunks (approximate output)."
+            )
+            mm.soft_empty_cache()
+            output = _forward_temporal_chunked(model, work, (temporal, target_h, target_w), **model_kwargs)
         del work
         output.mul_(norm_std).add_(norm_mean)
 
@@ -529,9 +614,9 @@ def upscale_clean_video_exact(
     output = output.to(device=result_device, dtype=original_dtype)
     if requested_device.type == "cuda":
         if offload_after_upscale:
-            model.to("cpu")
+            unload_model(model_name, requested_device, precision)
         if offload_after_upscale or clear_cuda_cache:
-            torch.cuda.empty_cache()
+            mm.soft_empty_cache()
     return output
 
 # ==========================================
