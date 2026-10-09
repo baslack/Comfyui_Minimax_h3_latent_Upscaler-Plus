@@ -41,6 +41,15 @@ from .minimax_h3_refine import (
 NODE_CLASS_MAPPINGS.update(NODE_CLASS_MAPPINGS_REFINE)
 NODE_DISPLAY_NAME_MAPPINGS.update(NODE_DISPLAY_NAME_MAPPINGS_REFINE)
 
+# Split/combine the joint MiniMax H3 AV NestedTensor so a video-only node (e.g.
+# the standalone learned upscaler) can run on the video member alone.
+from .minimax_h3_av_latent_split import (
+    NODE_CLASS_MAPPINGS as NODE_CLASS_MAPPINGS_AV_SPLIT,
+    NODE_DISPLAY_NAME_MAPPINGS as NODE_DISPLAY_NAME_MAPPINGS_AV_SPLIT,
+)
+NODE_CLASS_MAPPINGS.update(NODE_CLASS_MAPPINGS_AV_SPLIT)
+NODE_DISPLAY_NAME_MAPPINGS.update(NODE_DISPLAY_NAME_MAPPINGS_AV_SPLIT)
+
 # Continuum list outputs must be consumed as one ordered sequence so sampler 2
 # can carry the actual post-refine tail of chunk N into chunk N+1's protected
 # Native-Masked prefix.  Register this wrapper last under the same stable node
