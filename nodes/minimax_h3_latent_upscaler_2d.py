@@ -439,7 +439,10 @@ class MinimaxH3LatentUpscalerNode2D:
 
     def run(self, latent, model_name, scale, device, precision):
         if model_name.startswith('('):
-            raise ValueError("请将模型文件放入 latent_upscale_models 目录")
+            raise ValueError(
+                "请从 https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler 下载模型，"
+                "并放入 ComfyUI/models/latent_upscale_models 目录"
+            )
 
         if abs(scale - 1.0) < 1e-6:
             return (latent,)
