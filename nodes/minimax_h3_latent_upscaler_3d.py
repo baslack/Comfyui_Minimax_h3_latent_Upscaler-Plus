@@ -609,6 +609,17 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
                         "Leave off for faster repeated runs when VRAM is available."
                     ),
                 ),
+                io.Custom("H3_LATENT_UPSCALER").Input(
+                    "learned_upscaler",
+                    optional=True,
+                    tooltip=(
+                        "Optional MinimaxH3LatentUpscaler3DProvider. When connected, this node's "
+                        "own model_name/device/precision/offload_after_upscale widgets are ignored "
+                        "and the provider's loaded checkpoint is used instead -- share one loaded "
+                        "model across this node and any other consumer (e.g. a conditioning-geometry "
+                        "resize step) instead of picking the checkpoint separately on each node."
+                    ),
+                ),
             ],
             outputs=[
                 io.AnyType.Output("latent", tooltip="Upscaled latent."),
@@ -618,9 +629,10 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
     @classmethod
     def execute(cls, latent: dict, model_name: str, mode: UpscaleConfig,
                 align: int, keep_proportion: bool,
-                device: str, precision: str, offload_after_upscale: bool = False) -> io.NodeOutput:
+                device: str, precision: str, offload_after_upscale: bool = False,
+                learned_upscaler=None) -> io.NodeOutput:
 
-        if model_name.startswith('('):
+        if learned_upscaler is None and model_name.startswith('('):
             raise ValueError("Please place model files into the latent_upscale_models directory")
 
         selected_mode = mode["mode"]
@@ -693,18 +705,24 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
 
         # 4. Inference. Keep the full temporal sequence intact: GroupNorm and the
         #    stacked 3D/temporal convolutions make naive temporal chunking non-equivalent.
-        out = upscale_clean_video_exact(
-            s,
-            model_name=model_name,
-            target_h=h_out,
-            target_w=w_out,
-            device=str(dev),
-            precision=precision,
-            offload_after_upscale=offload_after_upscale,
-            output_device="cpu",
-            clear_cuda_cache=True,
-            scale_embedding=effective_scale,
-        )
+        if learned_upscaler is not None:
+            # Loaded/configured by a MinimaxH3LatentUpscaler3DProvider elsewhere in the
+            # graph -- shares one checkpoint with any other consumer instead of each
+            # node resolving model_name/device/precision on its own.
+            out = learned_upscaler.upscale_clean_video(s, target_h=h_out, target_w=w_out).to("cpu")
+        else:
+            out = upscale_clean_video_exact(
+                s,
+                model_name=model_name,
+                target_h=h_out,
+                target_w=w_out,
+                device=str(dev),
+                precision=precision,
+                offload_after_upscale=offload_after_upscale,
+                output_device="cpu",
+                clear_cuda_cache=True,
+                scale_embedding=effective_scale,
+            )
 
         if was_4d:
             out = out.squeeze(2)
