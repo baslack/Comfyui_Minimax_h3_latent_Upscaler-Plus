@@ -133,15 +133,7 @@ def _offload_cached_lbh_model(model_name: str, device: str, precision: str) -> b
     if target.type != "cuda":
         return False
 
-    lbh = _lbh_module()
-    cache_key = f"{model_name}::{target}::{precision}"
-    cached = lbh.MODEL_CACHE.get(cache_key)
-    if cached is None:
-        return False
-
-    cached.to("cpu")
-    torch.cuda.empty_cache()
-    return True
+    return _lbh_module().unload_model(model_name, target, precision)
 
 
 def build_clean_h3_upscale(
