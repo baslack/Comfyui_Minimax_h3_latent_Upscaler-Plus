@@ -718,7 +718,11 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
                 learned_upscaler=None) -> io.NodeOutput:
 
         if learned_upscaler is None and model_name.startswith('('):
-            raise ValueError("Please place model files into the latent_upscale_models directory")
+            raise ValueError(
+                "No MiniMax H3 latent upscaler checkpoint found. Download one from "
+                "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler and put it in "
+                "ComfyUI/models/latent_upscale_models/."
+            )
 
         selected_mode = mode["mode"]
         src = latent["samples"]
