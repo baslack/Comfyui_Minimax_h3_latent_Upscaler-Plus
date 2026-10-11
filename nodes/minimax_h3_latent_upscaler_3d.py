@@ -660,7 +660,7 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
                             io.Int.Input("height", default=704, min=64, max=4096, step=8, tooltip="Target pixel height.")
                         ]),
                         io.DynamicCombo.Option(UpscaleMode.MEGAPIXELS, [
-                            io.Float.Input("megapixels", default=1.0, min=0.1, max=8.0, step=0.1, tooltip="Target megapixels (1024x1024 = 1MP).")
+                            io.Float.Input("megapixels", default=1.0, min=0.1, max=8.0, step=0.01, tooltip="Target megapixels (1024x1024 = 1MP).")
                         ])
                     ],
                 ),

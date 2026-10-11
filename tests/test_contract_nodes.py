@@ -85,3 +85,24 @@ def test_saved_workflow_widgets_still_map_to_the_same_inputs(mappings, key, save
     assert len(mapping) == len(saved)
     for name, spec, value in mapping:
         assert_saved_value_fits(name, spec, value)
+
+
+def _float_specs(schema, name):
+    """Every FLOAT spec called ``name``, including those inside a dynamic combo's options."""
+    if isinstance(schema, dict):
+        for key, value in schema.items():
+            if key == name and isinstance(value, tuple) and value[0] == "FLOAT":
+                yield value[1]
+            else:
+                yield from _float_specs(value, name)
+    elif isinstance(schema, (list, tuple)):
+        for value in schema:
+            yield from _float_specs(value, name)
+
+
+@pytest.mark.parametrize("key", ["MinimaxH3LatentUpscaler3D", "MinimaxH3LatentUpscaler3DRefineHandoff"])
+def test_megapixels_keeps_two_decimal_places_in_the_editor(mappings, key):
+    # The frontend rounds a float widget to the decimal places of its step
+    # unless the node sets its own round.
+    (spec,) = _float_specs(mappings[key].INPUT_TYPES(), "megapixels")
+    assert (spec.get("round") or spec["step"]) <= 0.01
