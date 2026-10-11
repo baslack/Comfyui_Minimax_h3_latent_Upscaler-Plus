@@ -346,7 +346,7 @@ class MinimaxH3LatentUpscaler3DRefine:
                 "scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.05}),
                 "width": ("INT", {"default": 1280, "min": 64, "max": 4096, "step": 8}),
                 "height": ("INT", {"default": 704, "min": 64, "max": 4096, "step": 8}),
-                "megapixels": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 8.0, "step": 0.1}),
+                "megapixels": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 8.0, "step": 0.01}),
                 "align": ("INT", {"default": 32, "min": 1, "max": 512, "step": 1}),
                 "keep_proportion": ("BOOLEAN", {"default": True}),
                 "lock_audio": (
